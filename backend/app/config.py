@@ -1,0 +1,31 @@
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BACKEND = Path(__file__).resolve().parent.parent
+ROOT = BACKEND.parent
+load_dotenv(BACKEND / ".env")
+
+PORT = int(os.getenv("JARVIS_PORT", "8040"))
+DB_PATH = BACKEND / os.getenv("DB_PATH", "data/jarvis.db")
+FRONTEND = ROOT / "frontend"
+
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+NETWORK_SCANNER_URL = os.getenv("NETWORK_SCANNER_URL", "http://127.0.0.1:8030").rstrip("/")
+
+# Defaults for settings the HUD can change; stored values in the database win.
+DEFAULTS = {
+    "model": os.getenv("OLLAMA_MODEL", "qwen2.5:3b"),
+    "user_name": "",
+    "honorific": "sir",
+    "city": "",
+    "voice": "en-GB-RyanNeural",
+    "speech_lang": "en-US",
+    "wake_word": "true",
+    "units": "metric",
+}
+
+HISTORY_TURNS = 8
+MAX_TOOL_ROUNDS = 4
+USER_AGENT = "YoloJarvis/1.0 (https://github.com/; local personal assistant) httpx/0.28"

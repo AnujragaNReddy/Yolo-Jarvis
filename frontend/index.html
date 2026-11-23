@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>J.A.R.V.I.S.</title>
+  <meta name="description" content="YOLO-JARVIS, your personal voice assistant">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='none' stroke='%2300d8ff' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='12' fill='%2300d8ff'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="grid-bg" aria-hidden="true"></div>
+
+  <div id="boot" class="boot">
+    <div class="boot-inner">
+      <div class="boot-ring" aria-hidden="true"><span></span><span></span><span></span></div>
+      <h1>J.A.R.V.I.S.</h1>
+      <p class="boot-sub">Just A Rather Very Intelligent System</p>
+      <pre id="boot-log" class="boot-log" aria-live="polite"></pre>
+      <button id="boot-go" class="btn primary boot-go" disabled>Initialising…</button>
+      <p class="boot-hint">Click to start. Your browser will ask to use the microphone, so JARVIS can hear "Jarvis".</p>
+    </div>
+  </div>
+
+  <header class="top">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <b>J.A.R.V.I.S.</b>
+        <small>YOLO-JARVIS · personal assistant</small>
+      </div>
+    </div>
+    <div class="chips" id="chips">
+      <span class="chip" id="chip-brain" title="Language model">BRAIN —</span>
+      <span class="chip" id="chip-ears" title="Microphone">EARS —</span>
+      <span class="chip" id="chip-voice" title="Voice">VOICE —</span>
+    </div>
+    <div class="top-actions">
+      <button class="icon-btn" id="btn-mute" title="Voice on/off (M)" aria-label="Voice on or off"></button>
+      <button class="icon-btn" id="btn-new" title="New conversation" aria-label="New conversation">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-settings" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="layout">
+    <aside class="col left">
+      <section class="panel clock">
+        <div class="panel-k">// local time</div>
+        <div class="clock-time" id="clock-time">--:--</div>
+        <div class="clock-sec" id="clock-sec">--</div>
+        <div class="clock-date" id="clock-date">—</div>
+      </section>
+
+      <section class="panel" id="weather-panel">
+        <div class="panel-k">// atmospherics</div>
+        <div class="weather" id="weather"><p class="muted">Reading the sky…</p></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-k">// system diagnostics</div>
+        <div class="gauges" id="gauges"></div>
+        <div class="sys-meta" id="sys-meta"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-k">// home network</div>
+        <div id="network"><p class="muted">Checking…</p></div>
+      </section>
+    </aside>
+
+    <section class="col center">
+      <div class="reactor-wrap">
+        <canvas id="reactor" width="520" height="520" aria-hidden="true"></canvas>
+        <button class="reactor-hit" id="reactor-hit" aria-label="Talk to JARVIS"></button>
+        <div class="state" id="state" aria-live="polite">STANDBY</div>
+      </div>
+      <div class="hear" id="hear" aria-live="polite"></div>
+      <div class="activity" id="activity" aria-live="polite"></div>
+      <div class="answer" id="answer" aria-live="polite"></div>
+      <div class="cards" id="cards"></div>
+
+      <form class="ask" id="ask" autocomplete="off">
+        <button type="button" class="mic" id="mic" aria-label="Talk (or hold Space)">
+          <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+        </button>
+        <input id="q" placeholder='Say "Jarvis…" or type a command' aria-label="Command">
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+      <p class="hint" id="hint">Try: "Jarvis, good morning" · "what's the weather" · "open Spotify" · "set a timer for 5 minutes" · "who is on my wifi"</p>
+    </section>
+
+    <aside class="col right">
+      <section class="panel log-panel">
+        <div class="panel-k">// conversation</div>
+        <div class="log" id="log"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-k">// timers &amp; reminders</div>
+        <div id="reminders"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-k">// your list</div>
+        <form class="mini-add" id="note-form" autocomplete="off">
+          <input id="note-input" placeholder="Add an item" aria-label="New list item">
+          <button class="btn" type="submit">Add</button>
+        </form>
+        <div id="notes"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-k">// memory banks</div>
+        <div id="memory"></div>
+      </section>
+    </aside>
+  </main>
+
+  <dialog id="settings" class="dialog">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+      <div class="field-grid">
+        <label>Your name<input name="user_name" placeholder="e.g. Tony"></label>
+        <label>JARVIS calls you<input name="honorific" placeholder="sir"></label>
+        <label>Your city<input name="city" placeholder="Blank = work it out"></label>
+        <label>Units
+          <select name="units"><option value="metric">Metric (°C, km/h)</option><option value="imperial">Imperial (°F, mph)</option></select>
+        </label>
+        <label>Voice<select name="voice" id="voice-select"></select></label>
+        <label>Speech language
+          <select name="speech_lang">
+            <option value="en-US">English (US)</option><option value="en-GB">English (UK)</option>
+            <option value="en-IN">English (India)</option><option value="en-AU">English (Australia)</option>
+          </select>
+        </label>
+        <label>Brain (Ollama model)<select name="model" id="model-select"></select></label>
+        <label class="check"><input type="checkbox" name="wake_word"> Always listen for "Jarvis"</label>
+      </div>
+      <p class="muted small">Everything stays on this PC, except: the voice (Microsoft's free online voices), speech recognition (your browser's own service), and web searches, weather and news.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="test-voice">Test voice</button>
+        <span class="grow"></span>
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="save" class="btn primary" id="save-settings">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="assertive"></div>
+
+  <script src="reactor.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
