@@ -270,6 +270,71 @@ def open_file(path: str) -> str:
     return f"Opened {p.name}."
 
 
+def _ps(script: str, timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW)
+
+
+@tool("Set or change the laptop screen brightness.", action="string: up, down or set", level="integer?: 0-100, only for set")
+def brightness(action: str, level: int | None = None) -> str:
+    cur = _ps("(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness | Select-Object -First 1).CurrentBrightness").stdout.strip()
+    if not cur.isdigit():
+        return "This screen's brightness can't be changed from software (it may be an external monitor)."
+    value = {"up": int(cur) + 20, "down": int(cur) - 20}.get(action.lower(), level if level is not None else int(cur))
+    value = max(0, min(100, int(value)))
+    _ps(f"Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | "
+        f"Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{Timeout=1; Brightness={value}}} | Out-Null")
+    return f"Brightness {value}%."
+
+
+@tool("Take a screenshot of the whole screen (saved to Pictures\\Screenshots).")
+def screenshot() -> str:
+    # Win + Print Screen: Windows saves the shot itself, to Pictures\Screenshots.
+    u = ctypes.windll.user32
+    u.keybd_event(0x5B, 0, 0, 0)
+    u.keybd_event(0x2C, 0, 0, 0)
+    u.keybd_event(0x2C, 0, 2, 0)
+    u.keybd_event(0x5B, 0, 2, 0)
+    return "Screenshot saved to Pictures, Screenshots."
+
+
+def show_desktop() -> str:
+    u = ctypes.windll.user32
+    u.keybd_event(0x5B, 0, 0, 0)
+    u.keybd_event(0x44, 0, 0, 0)
+    u.keybd_event(0x44, 0, 2, 0)
+    u.keybd_event(0x5B, 0, 2, 0)
+    return "Showing the desktop."
+
+
+SETTINGS_PAGES = {"wifi": "ms-settings:network-wifi", "wi-fi": "ms-settings:network-wifi", "bluetooth": "ms-settings:bluetooth",
+                  "display": "ms-settings:display", "sound": "ms-settings:sound", "battery": "ms-settings:batterysaver",
+                  "update": "ms-settings:windowsupdate", "windows update": "ms-settings:windowsupdate",
+                  "network": "ms-settings:network", "apps": "ms-settings:appsfeatures", "storage": "ms-settings:storagesense"}
+
+
+def open_settings(page: str) -> str:
+    os.startfile(SETTINGS_PAGES.get(page.lower(), "ms-settings:"))
+    return f"Opened {page} settings."
+
+
+def recycle_bin_count() -> int:
+    out = _ps("(New-Object -ComObject Shell.Application).NameSpace(10).Items().Count").stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
+def empty_recycle_bin() -> str:
+    """Only reachable through an explicit spoken command plus "confirm" (see intents.py), never the model."""
+    r = _ps("Clear-RecycleBin -Force -ErrorAction Stop", timeout=120)
+    return "Recycle Bin emptied." if r.returncode == 0 else "I couldn't empty the Recycle Bin."
+
+
+def sleep() -> str:
+    """Only reachable through an explicit spoken command plus "confirm"."""
+    threading.Timer(3, lambda: ctypes.windll.powrprof.SetSuspendState(False, True, False)).start()
+    return "Going to sleep. Goodnight."
+
+
 def power(action: str) -> str:
     """Only reachable through an explicit spoken command plus "confirm" (see intents.py), never the model."""
     if action == "cancel":

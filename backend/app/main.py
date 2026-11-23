@@ -1,16 +1,18 @@
 import asyncio
 import json
+import mimetypes
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import brain, config, db, tts
+from . import access, brain, config, db, stt, tts
 from .tools import info, memory, network, system, timers
 
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 _listeners: set[asyncio.Queue] = set()
 _cache: dict[str, tuple[float, object]] = {}
 
@@ -44,7 +46,7 @@ async def _reminder_loop():
 async def lifespan(app: FastAPI):
     db.conn()
     tasks = [asyncio.create_task(_reminder_loop()), asyncio.create_task(brain.warm_up()),
-             asyncio.create_task(asyncio.to_thread(system.warm))]
+             asyncio.create_task(asyncio.to_thread(system.warm)), asyncio.create_task(asyncio.to_thread(stt.warm))]
     yield
     for t in tasks:
         t.cancel()
@@ -52,21 +54,47 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="YOLO-JARVIS", lifespan=lifespan)
 
-ALLOWED_HOSTS = {f"127.0.0.1:{config.PORT}", f"localhost:{config.PORT}"}
+LOCKED_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>J.A.R.V.I.S.</title><body style="background:#02060d;color:#d4f4ff;font:17px system-ui;display:grid;place-items:center;
+min-height:100vh;margin:0;padding:16px;text-align:center"><div><h1 style="color:#6ce9ff;letter-spacing:.2em">J.A.R.V.I.S.</h1>
+<p>This device needs the access link.</p><p style="color:#7ea8bf">On the PC running JARVIS, open Settings and use the
+"Open on another device" link.</p></div>"""
 
 
 @app.middleware("http")
-async def local_only(request: Request, call_next):
-    # JARVIS can open apps and change the PC, so refuse anything that isn't this PC's own HUD: other hostnames
-    # (DNS rebinding) and requests sent by other websites open in the browser.
-    if request.headers.get("host", "") not in ALLOWED_HOSTS:
-        return JSONResponse({"detail": "JARVIS only answers on localhost."}, status_code=403)
+async def guard(request: Request, call_next):
+    # JARVIS can open apps and change the PC, so it refuses: hostnames that aren't an IP or localhost (DNS
+    # rebinding), requests sent by other websites open in a browser, and other devices without the access key.
+    host = request.headers.get("host", "")
+    if not access.host_ok(host):
+        return JSONResponse({"detail": "Refused: unknown host."}, status_code=403)
     origin = request.headers.get("origin")
-    if origin and origin.split("://", 1)[-1] not in ALLOWED_HOSTS:
+    if origin and origin.split("://", 1)[-1] != host:
         return JSONResponse({"detail": "Requests from other websites are refused."}, status_code=403)
-    if request.method in ("POST", "PUT", "PATCH") and not request.headers.get("content-type", "").startswith("application/json"):
-        return JSONResponse({"detail": "Send JSON."}, status_code=415)
-    return await call_next(request)
+    ctype = request.headers.get("content-type", "")
+    wanted = ("audio/", "application/octet-stream") if request.url.path == "/api/stt" else ("application/json",)
+    if request.method in ("POST", "PUT", "PATCH") and not ctype.startswith(wanted):
+        return JSONResponse({"detail": "Wrong content type."}, status_code=415)
+    # Public, harmless files: the certificate a phone installs before opening the link, and the home-screen icon
+    # files, which browsers fetch without cookies.
+    if request.url.path in ("/jarvis-ca.crt", "/icon.svg", "/manifest.webmanifest"):
+        return await call_next(request)
+
+    local = access.is_local(request.client.host if request.client else None)
+    given = request.query_params.get("key")
+    if not local and not access.check(request.cookies.get(access.COOKIE)) and not access.check(given):
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"detail": "This device needs the access link."}, status_code=401)
+        return HTMLResponse(LOCKED_PAGE, status_code=401)
+    if not local and given and access.check(given):
+        # Remember this device, and take the key out of the address bar and history.
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie(access.COOKIE, given, max_age=60 * 60 * 24 * 365, httponly=True, samesite="strict",
+                        secure=request.url.scheme == "https")
+        return resp
+    response = await call_next(request)
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 class ChatBody(BaseModel):
@@ -150,7 +178,8 @@ async def status():
 async def health():
     models = await brain.models()
     model = db.setting("model")
-    return {"ok": True, "ollama": bool(models), "model": model, "model_installed": model in models}
+    return {"ok": True, "ollama": bool(models), "model": model, "model_installed": model in models,
+            "provider": brain.provider(), "cloud_model": config.GROQ_MODEL if config.GROQ_API_KEY else None}
 
 
 @app.get("/api/settings")
@@ -171,6 +200,41 @@ async def set_settings(values: dict):
 async def history():
     return [{"role": h["role"], "content": h["content"], "tools": json.loads(h["tools"]) if h["tools"] else [],
              "ts": h["ts"]} for h in db.recent_history(40)]
+
+
+@app.post("/api/stt")
+async def speech_to_text(request: Request):
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "No audio.")
+    if len(audio) > 8_000_000:
+        raise HTTPException(413, "Recording too long.")
+    try:
+        text = await asyncio.to_thread(stt.transcribe, audio, db.setting("speech_lang"),
+                                       request.headers.get("content-type", "audio/webm"))
+    except Exception as e:
+        raise HTTPException(500, f"Couldn't understand the recording: {e}")
+    return {"text": text}
+
+
+@app.get("/jarvis-ca.crt")
+async def ca_cert():
+    from . import certs
+
+    if not certs.CA_CERT.exists():
+        raise HTTPException(404, "Network mode is off.")
+    return Response(certs.CA_CERT.read_bytes(), media_type="application/x-x509-ca-cert",
+                    headers={"Content-Disposition": 'attachment; filename="jarvis-ca.crt"'})
+
+
+@app.get("/api/lan")
+async def lan(request: Request):
+    """The access link, shown only on the PC itself (it is the key to everything)."""
+    if not access.is_local(request.client.host if request.client else None):
+        return {"enabled": config.LAN, "link": None}
+    ip = access.lan_ip()
+    return {"enabled": config.LAN, "link": access.link() if config.LAN else None,
+            "ca_url": f"https://{ip}:{config.HTTPS_PORT}/jarvis-ca.crt" if config.LAN and ip else None}
 
 
 @app.post("/api/new-session")

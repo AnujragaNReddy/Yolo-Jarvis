@@ -98,20 +98,58 @@ def match(raw: str) -> dict | None:
         return _r(f"Yes, {you()}?", "wake")
 
     if _pending:
-        action = _pending.pop("action")
-        if time.time() < _pending.pop("expires", 0) and re.fullmatch(r"(yes|yeah|yep|confirm(ed)?|do it|go ahead|proceed)( please)?", t):
-            return _r(system.power(action), "power")
+        run, label, expires = _pending.pop("run"), _pending.pop("label"), _pending.pop("expires", 0)
         _pending.clear()
+        if time.time() < expires and re.fullmatch(r"(yes|yeah|yep|yes please|sure|ok|okay|confirm(ed)?|do it|go ahead|proceed)( please)?", t):
+            return _r(run(), label)
         if re.fullmatch(r"(no|nope|cancel|don't|do not|stop|never ?mind|abort)", t):
-            return _r("Cancelled.", "power")
+            return _r("Cancelled.", label)
+
+    def ask(question: str, run, label: str) -> dict:
+        # Things that can't be undone wait for a spoken "confirm" (30 s), and the model can never trigger them.
+        _pending.update(run=run, label=label, expires=time.time() + 30)
+        return _r(f"{question} Say confirm to proceed.", label)
 
     if m := re.fullmatch(r"(shut ?down|turn off|power off|restart|reboot)( the| my)? ?(computer|pc|laptop|system)?", t):
         action = "restart" if m.group(1) in ("restart", "reboot") else "shutdown"
-        _pending.update(action=action, expires=time.time() + 30)
         verb = "restart" if action == "restart" else "shut down"
-        return _r(f"Shall I {verb} the computer, {you()}? Say confirm to proceed.", "power")
+        return ask(f"Shall I {verb} the computer, {you()}?", lambda: system.power(action), "power")
     if re.fullmatch(r"(cancel|abort|stop) (the )?(shut ?down|restart|reboot)", t):
         return _r(system.power("cancel"), "power")
+    if re.fullmatch(r"(go to |put (the |my )?(computer|pc|laptop) to )?sleep|sleep (mode|the (computer|pc|laptop))", t):
+        return ask(f"Put the computer to sleep, {you()}?", system.sleep, "power")
+    if re.search(r"\b(recycle|recylce|recyle|recycling) ?bin\b|\btrash\b", t) and re.search(r"\b(empty|clear|clean|delete|remove)\b", t):
+        n = system.recycle_bin_count()
+        if not n:
+            return _r(f"The Recycle Bin is already empty, {you()}.", "recycle_bin")
+        return ask(f"Empty the Recycle Bin? That permanently deletes {n} item{'s' if n != 1 else ''}.",
+                   system.empty_recycle_bin, "recycle_bin")
+    if re.search(r"\b(recycle|recyle|recylce) ?bin\b", t):
+        n = system.recycle_bin_count()
+        return _r(f"The Recycle Bin has {n} item{'s' if n != 1 else ''}." if n else "The Recycle Bin is empty.", "recycle_bin")
+
+    if m := re.fullmatch(r"(from now on |please )?(call me|address me as|my name is) (?P<name>[\w .'-]{1,30})", t):
+        name = re.search(r"(?:call me|address me as|my name is) (.+)", raw, re.I).group(1).strip(" .!")
+        db.save_settings({"user_name" if "name is" in t else "honorific": name})
+        return _r(f"Very well, {name}." if "name is" not in t else f"Nice to meet you, {name}.", "settings")
+    if re.fullmatch(r"(no|nope|yes|yeah|yep|ok|okay|sure|fine|alright|all right|got it|cool|hmm+|um+|uh+)", t):
+        return _r(f"Very good, {you()}.", "chat")
+
+    if m := re.fullmatch(r"(call|phone|ring|dial|video call|message|text|whatsapp|send a message to|send message to) (to )?(?!me\b)(?P<who>.+)", t):
+        return _r(f"I can't make calls or send messages yet, {you()}. I can open WhatsApp for you if you like.", "chat")
+
+    if re.fullmatch(r"(take a |take |capture (a |the )?)?screen ?shot|screen capture|capture (the |my )?screen", t):
+        return _r(system.screenshot(), "screenshot")
+    if m := re.fullmatch(r"(set |change )?(the )?(screen )?brightness (to |at )?(?P<n>\d{1,3})( percent| %|%)?", t):
+        return _r(system.brightness("set", int(m.group("n"))), "brightness")
+    if re.fullmatch(r"(increase|raise|turn up)( the)?( screen)? brightness|brightness up|brighter|make (it|the screen) brighter", t):
+        return _r(system.brightness("up"), "brightness")
+    if re.fullmatch(r"(decrease|lower|reduce|turn down|dim)( the)?( screen)? brightness|dim( the)? screen|brightness down|dimmer|make (it|the screen) (dimmer|darker)", t):
+        return _r(system.brightness("down"), "brightness")
+    if re.fullmatch(r"(show( the)? desktop|minimi[sz]e (all|everything)( windows)?|hide (all )?(the )?windows)", t):
+        return _r(system.show_desktop(), "show_desktop")
+    if m := re.fullmatch(r"open (the )?(?P<page>wi-?fi|bluetooth|display|sound|battery|update|windows update|network|apps|storage) settings", t):
+        return _r(system.open_settings(m.group("page")), "open_settings")
 
     if re.fullmatch(r"(hi|hello|hey|yo|good (morning|afternoon|evening)|wake up|are you there|you there)", t):
         if t.startswith("good morning") or t == "wake up":

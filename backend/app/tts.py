@@ -25,8 +25,14 @@ def speakable(text: str) -> str:
 async def synth(text: str, voice: str) -> bytes:
     if voice not in {v["id"] for v in VOICES}:
         voice = VOICES[0]["id"]
-    out = bytearray()
-    async for chunk in edge_tts.Communicate(speakable(text), voice, rate="+4%", pitch="-2Hz").stream():
-        if chunk["type"] == "audio":
-            out += chunk["data"]
-    return bytes(out)
+    for attempt in range(2):  # the free voice service drops a request now and then
+        out = bytearray()
+        try:
+            async for chunk in edge_tts.Communicate(speakable(text), voice, rate="+4%", pitch="-2Hz").stream():
+                if chunk["type"] == "audio":
+                    out += chunk["data"]
+            return bytes(out)
+        except edge_tts.exceptions.NoAudioReceived:
+            if attempt:
+                raise
+    return b""

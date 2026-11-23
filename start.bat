@@ -29,10 +29,20 @@ powershell -NoProfile -Command "try { Invoke-RestMethod http://127.0.0.1:11434/a
 set "PORT=8040"
 if exist "backend\.env" for /f "tokens=1,2 delims==" %%a in ('findstr /b "JARVIS_PORT=" backend\.env') do set "PORT=%%b"
 
+rem Already running (another window, or started at login)? Just open it.
+powershell -NoProfile -Command "if (Get-NetTCPConnection -State Listen -LocalPort %PORT% -ErrorAction SilentlyContinue) { exit 1 }" >nul 2>nul
+if errorlevel 1 (
+  echo.
+  echo   JARVIS is already running. Opening http://localhost:%PORT%
+  echo   To restart it, close its other window first.
+  echo.
+  start "" "http://localhost:%PORT%"
+  timeout /t 5 >nul
+  exit /b 0
+)
+
 echo.
-echo   YOLO-JARVIS  ->  http://localhost:%PORT%
-echo   Open it in Chrome or Edge (they have speech recognition). Close this window to shut JARVIS down.
-echo.
+echo   Open JARVIS in Chrome or Edge. Close this window to shut JARVIS down.
 start "" "http://localhost:%PORT%"
 cd backend
-.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port %PORT% --timeout-keep-alive 75
+.venv\Scripts\python.exe -m app

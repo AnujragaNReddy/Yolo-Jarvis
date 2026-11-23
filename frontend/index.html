@@ -6,6 +6,12 @@
   <title>J.A.R.V.I.S.</title>
   <meta name="description" content="YOLO-JARVIS, your personal voice assistant">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='none' stroke='%2300d8ff' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='12' fill='%2300d8ff'/%3E%3C/svg%3E">
+  <link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+  <meta name="theme-color" content="#02060d">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="JARVIS">
+  <link rel="apple-touch-icon" href="icon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -21,7 +27,7 @@
       <p class="boot-sub">Just A Rather Very Intelligent System</p>
       <pre id="boot-log" class="boot-log" aria-live="polite"></pre>
       <button id="boot-go" class="btn primary boot-go" disabled>Initialising…</button>
-      <p class="boot-hint">Click to start. Your browser will ask to use the microphone, so JARVIS can hear "Jarvis".</p>
+      <p class="boot-hint">Tap to start. Allow the microphone when asked, so JARVIS can hear you.</p>
     </div>
   </div>
 
@@ -143,9 +149,10 @@
           </select>
         </label>
         <label>Brain (Ollama model)<select name="model" id="model-select"></select></label>
-        <label class="check"><input type="checkbox" name="wake_word"> Always listen for "Jarvis"</label>
+        <label class="wide">Listening on this device<select id="listen-mode"></select></label>
       </div>
-      <p class="muted small">Everything stays on this PC, except: the voice (Microsoft's free online voices), speech recognition (your browser's own service), and web searches, weather and news.</p>
+      <div class="lan-box" id="lan-box"></div>
+      <p class="muted small">Everything stays on this PC, except: the voice (Microsoft's free online voices), the "Jarvis" wake word (your browser's own speech service; tap to talk is transcribed on this PC instead), and web searches, weather and news.</p>
       <div class="dialog-actions">
         <button type="button" class="btn" id="test-voice">Test voice</button>
         <span class="grow"></span>

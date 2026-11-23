@@ -33,15 +33,31 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)) } catch { /* private mode */ } },
 }
 
-let settings = { honorific: 'sir', voice: 'en-GB-RyanNeural', speech_lang: 'en-US', wake_word: 'true' }
+let settings = { honorific: 'sir', voice: 'en-GB-RyanNeural', speech_lang: 'en-US' }
 let voiceOn = store.get('jarvis.voice', true)
 let busy = false
 let clockOffset = 0
 let reminders = []
+let lastByVoice = false
 
 const you = () => settings.honorific || settings.user_name || 'sir'
 const You = () => you().charAt(0).toUpperCase() + you().slice(1)
-const wakeOn = () => settings.wake_word === 'true'
+
+const MOBILE = matchMedia('(pointer: coarse)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+const IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+const CAN_RECORD = !!(window.isSecureContext && navigator.mediaDevices?.getUserMedia && window.MediaRecorder)
+// Per device: "wake" = always listen for "Jarvis" (browser speech recognition, good on desktop Chrome/Edge);
+// "tap" = tap to talk, recorded here and transcribed on the PC (works on phones and every browser).
+let listenMode = store.get('jarvis.listen', null)
+function pickMode() {
+  const SRok = !!(window.isSecureContext && (window.SpeechRecognition || window.webkitSpeechRecognition))
+  if (listenMode === 'wake' && SRok) return 'wake'
+  if (listenMode === 'tap' && CAN_RECORD) return 'tap'
+  if (!MOBILE && SRok) return 'wake'
+  if (CAN_RECORD) return 'tap'
+  return 'type'
+}
+const wakeOn = () => pickMode() === 'wake'
 
 /* ---------------- state ---------------- */
 const LABEL = { standby: 'STANDBY', active: 'LISTENING', thinking: 'PROCESSING', speaking: 'SPEAKING', off: 'MIC OFF' }
@@ -85,7 +101,8 @@ function chip(id, text, tone) {
 }
 
 /* ---------------- ears: wake word + speech recognition ---------------- */
-const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+// Browsers only allow the microphone on localhost or HTTPS, so a phone on http://<PC-IP> types instead.
+const SR = window.isSecureContext ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null
 const WAKE = /\b(?:hey |hi |ok |okay )?(?:jarvis|jervis|jarvas|jarves|jarviss|charvis|javis)\b[\s,.!?]*/i
 const STOP = /^(stop|quiet|silence|shut up|be quiet|cancel|never ?mind|that's all|that is all|enough)[.!]?$/i
 
@@ -102,7 +119,7 @@ const ears = {
     rec.onend = () => {
       this.running = false
       if (this.wanted && !this.paused) setTimeout(() => this.start(), 250)
-      else if (!this.wanted) chip('chip-ears', 'EARS: OFF')
+      else if (!this.wanted && pickMode() === 'wake') chip('chip-ears', 'EARS: OFF')
     }
     rec.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
@@ -162,18 +179,124 @@ const ears = {
     const wake = wakeOn() && WAKE.test(text)
     if (wake) {
       const cmd = text.replace(WAKE, ' ').replace(/\s+/g, ' ').trim()
-      if (cmd.replace(/[^\w]/g, '').length > 1) submit(cmd, text)
+      if (cmd.replace(/[^\w]/g, '').length > 1) submit(cmd, text, true)
       else { chime(660, 0.08); hear(`Yes, ${you()}?`); this.attend(8000) }
       return
     }
-    if (this.attentive) { submit(text, text); return }
+    if (this.attentive) { submit(text, text, true); return }
     if (uiState === 'active') { setState('standby'); hear('') }
   },
 }
 
+/* ---------------- tap to talk: record here, transcribe on the PC ---------------- */
+const recorder = {
+  stream: null, active: false, stopFlag: false, idle: null,
+
+  async open() {
+    clearTimeout(this.idle)
+    if (!this.stream) {
+      this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+    }
+  },
+  release() {
+    // iPhones play quietly through the earpiece while the mic is open, so let go of it straight away there.
+    clearTimeout(this.idle)
+    this.idle = setTimeout(() => { this.stream?.getTracks().forEach((t) => t.stop()); this.stream = null }, IOS ? 0 : 20000)
+  },
+  stop() { this.stopFlag = true },
+
+  // Records until you stop talking (about 1.2 s of quiet), you tap again, or nothing is said in time.
+  async capture({ startTimeout = 8000, maxMs = 15000 } = {}) {
+    await this.open()
+    if (!audioCtx) audioCtx = new AudioContext()
+    await audioCtx.resume().catch(() => {})
+    const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find((m) => MediaRecorder.isTypeSupported?.(m)) || ''
+    const mr = new MediaRecorder(this.stream, mime ? { mimeType: mime } : undefined)
+    const chunks = []
+    mr.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data) }
+    const src = audioCtx.createMediaStreamSource(this.stream)
+    const an = audioCtx.createAnalyser()
+    an.fftSize = 1024
+    src.connect(an)
+    const buf = new Float32Array(an.fftSize)
+    this.active = true
+    this.stopFlag = false
+    mr.start(250)
+    const t0 = performance.now()
+    let floor = 0.006
+    let heard = false
+    let lastLoud = 0
+    await new Promise((resolve) => {
+      const tick = () => {
+        an.getFloatTimeDomainData(buf)
+        let s = 0
+        for (const v of buf) s += v * v
+        const rms = Math.sqrt(s / buf.length)
+        const t = performance.now() - t0
+        const thr = Math.max(0.02, floor * 3)
+        if (rms > thr) { heard = true; lastLoud = t } else floor = floor * 0.95 + rms * 0.05
+        Reactor.pushLevel(rms * 7)
+        if (this.stopFlag || t > maxMs || (heard && t - lastLoud > 1200) || (!heard && t > startTimeout)) return resolve()
+        setTimeout(tick, 50)
+      }
+      tick()
+    })
+    const stopped = new Promise((r) => { mr.onstop = r })
+    mr.stop()
+    await stopped
+    src.disconnect()
+    this.active = false
+    this.release()
+    const long = performance.now() - t0 > 600
+    if (!heard && !(this.stopFlag && long)) return null
+    return new Blob(chunks, { type: mr.mimeType || mime || 'audio/webm' })
+  },
+}
+
+function micProblem(e) {
+  if (e?.name === 'NotAllowedError') return 'Microphone blocked. Allow it for this page in the browser\'s site settings, then tap the mic again.'
+  if (e?.name === 'NotFoundError') return 'No microphone found on this device.'
+  return `Microphone problem: ${e?.message || e}`
+}
+
+async function tapListen({ followUp = false } = {}) {
+  if (recorder.active) { recorder.stop(); return }
+  if (busy) return
+  setState('active')
+  hear(followUp ? '' : 'Listening…', true)
+  let blob
+  try {
+    blob = await recorder.capture({ startTimeout: followUp ? 5000 : 8000 })
+  } catch (e) {
+    toast('Microphone', micProblem(e))
+    chip('chip-ears', 'EARS: BLOCKED', 'bad')
+    setState('standby')
+    hear('')
+    return
+  }
+  if (!blob) { setState('standby'); hear(''); return }
+  setState('thinking')
+  activity('Transcribing')
+  let text = ''
+  try {
+    const r = await fetch('/api/stt', { method: 'POST', headers: { 'Content-Type': blob.type || 'audio/webm' }, body: blob })
+    const j = await r.json()
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`)
+    text = j.text
+  } catch (e) {
+    toast('Speech', e.message)
+  }
+  activity('')
+  if (!text) { hear('Sorry, I didn\'t catch that.'); setState('standby'); return }
+  const wake = text.match(WAKE)
+  const cmd = text.replace(WAKE, ' ').replace(/\s+/g, ' ').trim()
+  if (wake && cmd.replace(/[^\w]/g, '').length <= 1) { chime(660, 0.08); tapListen({ followUp: true }); return }
+  submit(cmd || text, text, true)
+}
+
 setInterval(() => {
-  if (uiState === 'active' && !ears.attentive && !busy && !mouth.speaking) {
-    setState(ears.wanted || !SR ? 'standby' : 'off')
+  if (uiState === 'active' && !ears.attentive && !busy && !mouth.speaking && !recorder.active) {
+    setState(idleState())
     if ($('hear').classList.contains('live')) hear('')
     if (!wakeOn() && ears.wanted) ears.stop()
   }
@@ -198,8 +321,13 @@ function chime(freq = 880, dur = 0.12, times = 1) {
   }
 }
 
+function idleState() {
+  const mode = pickMode()
+  return mode === 'wake' && !ears.wanted ? 'off' : 'standby'
+}
+
 const mouth = {
-  speaking: false, audio: null, done: null,
+  speaking: false, src: null, done: null,
 
   async say(text, { voice, followUp = true } = {}) {
     if (!text) return
@@ -212,10 +340,9 @@ const mouth = {
       const r = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voice: voice || settings.voice }) })
       if (!r.ok) throw new Error('tts')
-      const url = URL.createObjectURL(await r.blob())
+      const data = await r.arrayBuffer()
       if (!this.speaking) return
-      await this.play(url)
-      URL.revokeObjectURL(url)
+      await this.play(data)
       chip('chip-voice', 'VOICE: NEURAL', 'ok')
     } catch {
       if (this.speaking) { chip('chip-voice', 'VOICE: BROWSER', 'warn'); await this.browser(text) }
@@ -227,35 +354,41 @@ const mouth = {
   },
 
   after(followUp) {
-    if (followUp && ears.wanted) ears.attend(6500)
-    else setState(ears.wanted || !SR ? 'standby' : 'off')
+    // After a spoken question, keep the conversation going hands-free; after a typed one, don't.
+    if (followUp && lastByVoice && pickMode() === 'tap') setTimeout(() => tapListen({ followUp: true }), 150)
+    else if (followUp && lastByVoice && ears.wanted) ears.attend(6500)
+    else setState(idleState())
   },
 
-  play(url) {
-    return new Promise((resolve) => {
-      const a = new Audio(url)
-      this.audio = a
-      this.done = resolve
-      if (audioCtx) {
-        try {
-          const src = audioCtx.createMediaElementSource(a)
-          const an = audioCtx.createAnalyser()
-          an.fftSize = 512
-          src.connect(an).connect(audioCtx.destination)
-          const buf = new Uint8Array(an.fftSize)
-          const tick = () => {
-            if (a.paused || a.ended) return
-            an.getByteTimeDomainData(buf)
-            let sum = 0
-            for (const v of buf) sum += ((v - 128) / 128) ** 2
-            Reactor.pushLevel(Math.sqrt(sum / buf.length) * 4)
-            requestAnimationFrame(tick)
-          }
-          a.addEventListener('play', tick)
-        } catch { /* analyser is decoration only */ }
+  // Plays through Web Audio, which phones allow once the page has been tapped (an <audio> element started
+  // after a network request is blocked on iPhones).
+  async play(data) {
+    if (!audioCtx) audioCtx = new AudioContext()
+    await audioCtx.resume().catch(() => {})
+    const buffer = await audioCtx.decodeAudioData(data)
+    if (!this.speaking) return
+    await new Promise((resolve) => {
+      const src = audioCtx.createBufferSource()
+      src.buffer = buffer
+      const an = audioCtx.createAnalyser()
+      an.fftSize = 512
+      src.connect(an).connect(audioCtx.destination)
+      const buf = new Uint8Array(an.fftSize)
+      let playing = true
+      const tick = () => {
+        if (!playing) return
+        an.getByteTimeDomainData(buf)
+        let sum = 0
+        for (const v of buf) sum += ((v - 128) / 128) ** 2
+        Reactor.pushLevel(Math.sqrt(sum / buf.length) * 4)
+        requestAnimationFrame(tick)
       }
-      a.onended = a.onerror = () => resolve()
-      a.play().catch(() => resolve())
+      const end = () => { playing = false; this.src = null; resolve() }
+      src.onended = end
+      this.src = src
+      this.done = end
+      src.start()
+      tick()
     })
   },
 
@@ -276,7 +409,7 @@ const mouth = {
   stop() {
     const was = this.speaking
     this.speaking = false
-    if (this.audio) { this.audio.pause(); this.audio = null }
+    if (this.src) { try { this.src.stop() } catch { /* already ended */ } this.src = null }
     try { speechSynthesis.cancel() } catch { /* none */ }
     if (this.done) { this.done(); this.done = null }
     return was
@@ -284,16 +417,17 @@ const mouth = {
 }
 
 /* ---------------- chat ---------------- */
-async function submit(text, heard) {
+async function submit(text, heard, byVoice = false) {
   text = (text || '').trim()
   if (!text || busy) return
   if (STOP.test(text)) {
     mouth.stop()
     ears.attentiveUntil = 0
     hear('')
-    setState(ears.wanted || !SR ? 'standby' : 'off')
+    setState(idleState())
     return
   }
+  lastByVoice = byVoice
   busy = true
   ears.attentiveUntil = 0
   mouth.stop()
@@ -586,6 +720,32 @@ async function openSettings() {
     if (el.type === 'checkbox') el.checked = settings[el.name] === 'true'
     else el.value = settings[el.name] ?? ''
   }
+  const sel = $('listen-mode')
+  const SRok = !!(window.isSecureContext && (window.SpeechRecognition || window.webkitSpeechRecognition))
+  sel.replaceChildren(
+    h('option', { value: 'wake', disabled: !SRok }, `Always listen for "Jarvis"${SRok ? '' : ' (needs Chrome or Edge)'}`),
+    h('option', { value: 'tap', disabled: !CAN_RECORD }, 'Tap to talk, then hands-free follow-ups (best on phones)'))
+  sel.value = pickMode() === 'type' ? 'tap' : pickMode()
+  const box = $('lan-box')
+  box.replaceChildren()
+  try {
+    const lan = await api('/api/lan')
+    if (lan.link) {
+      const copy = (text) => async () => {
+        try { await navigator.clipboard.writeText(text); toast('Copied', text.length > 60 ? 'Link copied.' : text) } catch { toast('Copy', 'Select it and copy it.') }
+      }
+      box.append(h('b', {}, 'Use JARVIS on your phone (same Wi-Fi)'),
+        h('ol', { class: 'muted small steps' },
+          h('li', {}, 'Send yourself this link and open it on the phone. It\'s the key to this PC: only open it on your own devices.'),
+          h('li', {}, 'The phone warns that the connection isn\'t private (JARVIS made its own certificate). Tap Advanced → Proceed (Android) or Show details → visit this website (iPhone). Or install the certificate below once to skip that.'),
+          h('li', {}, 'Tap Activate, then the mic or the reactor, and allow the microphone. Tip: browser menu → Add to Home screen.')),
+        h('div', { class: 'lan-row' }, h('code', {}, lan.link), h('button', { type: 'button', class: 'btn small', onclick: copy(lan.link) }, 'Copy')),
+        h('p', { class: 'muted small' }, 'Optional, removes the warning: open ', h('code', {}, lan.ca_url),
+          ' on the phone and install it. Android: Settings → Security → Encryption & credentials → Install a certificate → CA certificate. iPhone: Settings → Profile Downloaded → Install, then General → About → Certificate Trust Settings → turn on YOLO-JARVIS.'))
+    } else if (!lan.enabled) {
+      box.append(h('p', { class: 'muted small' }, 'Other devices: off. To use JARVIS from your phone, add JARVIS_LAN=true to backend\\.env and restart.'))
+    }
+  } catch { /* older backend */ }
   dlg.showModal()
 }
 
@@ -597,16 +757,30 @@ async function saveSettings() {
     values[el.name] = el.type === 'checkbox' ? String(el.checked) : el.value.trim()
   }
   if (!values.honorific) values.honorific = 'sir'
+  listenMode = $('listen-mode').value
+  store.set('jarvis.listen', listenMode)
   try {
     const r = await api('/api/settings', { method: 'POST', body: values })
     const langChanged = r.settings.speech_lang !== settings.speech_lang
     settings = { ...settings, ...r.settings }
     if (ears.rec && langChanged) { ears.rec.lang = settings.speech_lang; ears.pause(); ears.resume() }
-    if (wakeOn()) ears.start()
-    else { ears.stop(); setState(SR ? 'off' : 'standby'); chip('chip-ears', SR ? 'EARS: PUSH-TO-TALK' : 'EARS: TYPE ONLY', SR ? '' : 'warn') }
+    applyMode()
     toast('Settings', 'Saved.')
     refresh()
   } catch (e) { toast('Settings', e.message) }
+}
+
+function applyMode() {
+  const mode = pickMode()
+  if (mode === 'wake') {
+    if (!ears.rec) ears.init()
+    ears.start()
+  } else {
+    ears.stop()
+  }
+  chip('chip-ears', { wake: 'EARS: "JARVIS"', tap: 'EARS: TAP TO TALK', type: 'EARS: TYPE ONLY' }[mode], mode === 'type' ? 'warn' : 'ok')
+  $('mic').classList.toggle('off', mode === 'type')
+  setState(idleState())
 }
 
 function renderMute() {
@@ -628,12 +802,23 @@ $('ask').addEventListener('submit', (e) => {
 })
 
 function talk() {
+  if (!audioCtx) audioCtx = new AudioContext()
+  audioCtx.resume().catch(() => {})
+  const mode = pickMode()
+  if (mode === 'tap') {
+    if (recorder.active) { recorder.stop(); return }
+    mouth.stop()
+    if (busy) return
+    chime(660, 0.08)
+    tapListen()
+    return
+  }
+  if (mode === 'type') { $('q').focus(); return }
   if (mouth.stop()) { ears.attend(8000); return }
   if (busy) return
-  if (!audioCtx) audioCtx = new AudioContext()
   chime(660, 0.08)
   hear('')
-  ears.attend(wakeOn() ? 8000 : 10000)
+  ears.attend(8000)
 }
 $('mic').addEventListener('click', talk)
 $('reactor-hit').addEventListener('click', talk)
@@ -681,7 +866,8 @@ const HINTS = ['"Jarvis, good morning"', '"what\'s the weather in London"', '"op
   '"volume to 30"', '"lock the computer"', '"add milk to my list"']
 setInterval(() => {
   const pick = HINTS.slice().sort(() => Math.random() - 0.5).slice(0, 4)
-  $('hint').textContent = `${wakeOn() ? 'Say "Jarvis" then: ' : 'Press Space or the mic, then: '}${pick.join(' · ')}`
+  const lead = { wake: 'Say "Jarvis" then: ', tap: `${MOBILE ? 'Tap' : 'Press Space or'} the mic, then: `, type: 'Type: ' }[pickMode()]
+  $('hint').textContent = `${lead}${pick.join(' · ')}`
 }, 12000)
 
 function partOfDay() {
@@ -703,22 +889,28 @@ async function boot() {
     $('boot-go').textContent = 'Core offline'
     return
   }
-  await line(`> Neural engine: ${health.ollama ? `${health.model} ${health.model_installed ? 'online' : 'NOT INSTALLED'}` : 'Ollama not running'}`)
-  if (!health.ollama) {
+  const cloud = health.provider === 'groq'
+  await line(`> Neural engine: ${cloud ? `${health.cloud_model} (Groq cloud), local ${health.model} as backup`
+    : health.ollama ? `${health.model} ${health.model_installed ? 'online (local)' : 'NOT INSTALLED'}` : 'Ollama not running'}`)
+  if (cloud) {
+    chip('chip-brain', 'BRAIN: GROQ', 'ok')
+  } else if (!health.ollama) {
     $('banner').dataset.health = '1'
     showBanner('Ollama isn\'t running, so JARVIS can only do quick commands. Start Ollama, then reload.')
   } else if (!health.model_installed) {
     $('banner').dataset.health = '1'
     showBanner(`The model ${health.model} isn't installed. In a terminal run: ollama pull ${health.model}`)
   }
-  chip('chip-brain', health.ollama && health.model_installed ? `BRAIN: ${health.model.toUpperCase()}` : 'BRAIN: OFFLINE',
-    health.ollama && health.model_installed ? 'ok' : 'bad')
-  await line(`> Speech recognition: ${SR ? 'available' : 'unavailable in this browser (use Chrome or Edge)'}`)
-  await line(`> Wake word: ${wakeOn() ? '"Jarvis"' : 'off (push-to-talk)'}`)
+  if (!cloud) {
+    chip('chip-brain', health.ollama && health.model_installed ? `BRAIN: ${health.model.toUpperCase()}` : 'BRAIN: OFFLINE',
+      health.ollama && health.model_installed ? 'ok' : 'bad')
+  }
+  const mode = pickMode()
+  await line(`> Voice input: ${{ wake: 'always listening for "Jarvis"', tap: 'tap to talk, understood on your PC',
+    type: !window.isSecureContext ? 'off (the microphone needs the https link); type commands' : 'no microphone support here; type commands' }[mode]}`)
   await line('> Telemetry, memory banks, schedule… linked')
   await Promise.all([refresh(), loadHistory(), loadMemory()])
   await line('> All systems operational.', 120)
-  ears.init()
   renderMute()
   listen()
   const go = $('boot-go')
@@ -727,10 +919,13 @@ async function boot() {
   go.focus()
   go.addEventListener('click', () => {
     audioCtx = new AudioContext()
+    // Phones only let a page play sound after a tap; playing silence during this tap unlocks it for later.
+    const unlock = audioCtx.createBufferSource()
+    unlock.buffer = audioCtx.createBuffer(1, 1, 22050)
+    unlock.connect(audioCtx.destination)
+    unlock.start(0)
     $('boot').classList.add('gone')
-    if (wakeOn()) ears.start()
-    else setState(SR ? 'off' : 'standby')
-    if (!wakeOn() && SR) chip('chip-ears', 'EARS: PUSH-TO-TALK')
+    applyMode()
     chime(520, 0.1, 2)
     const name = settings.user_name ? `, ${settings.user_name}` : `, ${you()}`
     mouth.say(`Good ${partOfDay()}${name}. JARVIS online. All systems operational.`, { followUp: false })

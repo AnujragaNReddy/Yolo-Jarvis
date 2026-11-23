@@ -21,10 +21,30 @@ microphone.
 
 ## Talking to him
 
-- **Wake word:** say "Jarvis, what's the weather?" or just "Jarvis", wait for the chime, then speak.
-- After he answers he keeps listening for about 6 seconds, so follow-ups need no wake word.
-- **Push-to-talk:** press Space, the mic button, or the reactor. **Esc** or "stop" silences him.
-- Or type in the command box. **M** mutes his voice.
+Each device picks how it listens (Settings → Listening on this device):
+
+- **Always listen for "Jarvis"** (default on a computer with Chrome or Edge): say "Jarvis, what's the weather?"
+  or just "Jarvis", wait for the chime, then speak.
+- **Tap to talk** (default on phones, works in every browser): tap the mic or the reactor and speak. Recording
+  stops by itself when you stop talking, and your PC turns it into text (faster-whisper, offline).
+- After a spoken question he answers and then listens again for a few seconds, so a conversation needs no
+  more taps or wake words. **Esc**, tapping again, or "stop" silences him.
+- Or type in the command box. **Space** = talk, **M** = mute his voice.
+
+## On your phone
+
+1. In `backend\.env` set `JARVIS_LAN=true` and restart (`start.bat`). The window prints the phone link; Settings
+   on the PC shows it too, with a Copy button.
+2. Open the link on the phone (same Wi-Fi). It is the key to this PC, so only open it on your own devices.
+3. The phone warns the connection isn't private, because JARVIS makes its own HTTPS certificate (phones only
+   allow the microphone on HTTPS). Tap Advanced → Proceed (Android) or Show details → visit this website
+   (iPhone). To get rid of the warning for good, install `https://<PC-IP>:8443/jarvis-ca.crt` on the phone as
+   a trusted certificate (steps in Settings).
+4. Tap **Activate**, then the mic, and allow the microphone. Browser menu → **Add to Home screen** gives you a
+   JARVIS app icon.
+
+Commands from the phone act on the PC ("open Spotify" opens it on the PC); JARVIS's voice plays on the phone.
+The phone must be on the same Wi-Fi and the PC awake.
 
 | Say | What happens |
 |---|---|
@@ -64,10 +84,13 @@ language, AI model, and whether he always listens for "Jarvis".
 
 ## Privacy and safety
 
-- Your conversation, memories and the AI model stay on this PC. Speech recognition is your browser's own
-  service, the voice is Microsoft's free online voices, and web searches, weather and news go to those sites.
-- JARVIS only listens on this PC (127.0.0.1), and refuses requests from other websites, so a web page can't
-  tell him to open things.
+- Your conversation, memories, the AI model and tap-to-talk speech recognition stay on this PC. The "Jarvis"
+  wake word uses your browser's own speech service, the voice is Microsoft's free online voices, and web
+  searches, weather and news go to those sites.
+- By default JARVIS only answers on this PC (127.0.0.1). With `JARVIS_LAN=true`, other devices reach it only over
+  HTTPS on port 8443 and only with the secret link; it is saved as a secure cookie and never shown on other
+  devices. Delete `backend\data\access_key.txt` and restart to lock every device out.
+- Other websites can't send him commands, and hostnames other than an IP address are refused.
 - He won't run programs or scripts found in your files, only open documents, pictures and folders. He can't run
   shell commands. Shutdown and restart need a spoken "confirm" and are never chosen by the AI.
 
