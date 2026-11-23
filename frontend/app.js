@@ -206,15 +206,27 @@ const recorder = {
   stop() { this.stopFlag = true },
 
   // Records until you stop talking (about 1.2 s of quiet), you tap again, or nothing is said in time.
-  async capture({ startTimeout = 8000, maxMs = 15000 } = {}) {
-    await this.open()
+  // raw: the browser's noise suppression and auto-gain reshape a voice, which throws off voiceprint matching,
+  // so admin checks and enrollment record the microphone untouched.
+  async capture({ startTimeout = 8000, maxMs = 15000, raw = false } = {}) {
+    let stream
+    if (raw) {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } })
+    } else {
+      await this.open()
+      stream = this.stream
+    }
+    try { return await this.record(stream, startTimeout, maxMs) } finally { if (raw) stream.getTracks().forEach((t) => t.stop()) }
+  },
+
+  async record(stream, startTimeout, maxMs) {
     if (!audioCtx) audioCtx = new AudioContext()
     await audioCtx.resume().catch(() => {})
     const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find((m) => MediaRecorder.isTypeSupported?.(m)) || ''
-    const mr = new MediaRecorder(this.stream, mime ? { mimeType: mime } : undefined)
+    const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined)
     const chunks = []
     mr.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data) }
-    const src = audioCtx.createMediaStreamSource(this.stream)
+    const src = audioCtx.createMediaStreamSource(stream)
     const an = audioCtx.createAnalyser()
     an.fftSize = 1024
     src.connect(an)
@@ -288,8 +300,10 @@ async function tapListen({ followUp = false } = {}) {
   }
   activity('')
   if (!text) { hear('Sorry, I didn\'t catch that.'); setState('standby'); return }
-  const wake = text.match(WAKE)
-  const cmd = text.replace(WAKE, ' ').replace(/\s+/g, ' ').trim()
+  // Tapping already means "I'm talking to you", so only a leading "Jarvis" is dropped; a later one may be a name.
+  const LEAD = /^\s*(?:hey |hi |ok |okay )?(?:jarvis|jervis|jarvas|jarves|charvis|javis)\b[\s,.!?]*/i
+  const wake = LEAD.test(text)
+  const cmd = text.replace(LEAD, '').trim()
   if (wake && cmd.replace(/[^\w]/g, '').length <= 1) { chime(660, 0.08); tapListen({ followUp: true }); return }
   submit(cmd || text, text, true)
 }
@@ -421,6 +435,7 @@ async function submit(text, heard, byVoice = false) {
   text = (text || '').trim()
   if (!text || busy) return
   if (STOP.test(text)) {
+    if (approval) cancelApproval()
     mouth.stop()
     ears.attentiveUntil = 0
     hear('')
@@ -473,7 +488,181 @@ async function submit(text, heard, byVoice = false) {
   if ((answer.tools || []).includes('new_session')) loadHistory()
   refresh()
   loadMemory()
+  if (answer.admin) {
+    showApproval(answer.admin)
+    await mouth.say(answer.text, { followUp: false })
+    approve()
+    return
+  }
   await mouth.say(answer.text)
+}
+
+/* ---------------- admin approval: passphrase + voiceprint ---------------- */
+let approval = null
+
+function showApproval(ch) {
+  approval = { ...ch, until: Date.now() + ch.expires_in * 1000 }
+  const card = h('div', { class: 'card admin', id: 'admin-card' },
+    h('h3', {}, 'Admin approval needed'),
+    h('p', { class: 'admin-what' }, ch.summary),
+    h('p', { class: 'muted small' }, 'Say your secret passphrase. Your voice and the words must both match.'),
+    h('div', { class: 'admin-actions' },
+      h('button', { class: 'btn primary', type: 'button', onclick: () => approve() }, 'Speak passphrase'),
+      h('button', { class: 'btn', type: 'button', onclick: () => cancelApproval() }, 'Cancel')),
+    h('p', { class: 'admin-status', id: 'admin-status', 'aria-live': 'polite' }))
+  $('cards').prepend(card)
+}
+
+function closeApproval() {
+  approval = null
+  $('admin-card')?.remove()
+}
+
+async function cancelApproval() {
+  if (approval) api('/api/admin/cancel', { method: 'POST', body: { id: approval.id } }).catch(() => {})
+  if (recorder.active) recorder.stop()
+  closeApproval()
+  setState(idleState())
+  hear('')
+}
+
+async function approve() {
+  if (!approval || busy || recorder.active) return
+  if (Date.now() > approval.until) { $('admin-status').textContent = 'Expired. Ask again.'; return }
+  if (!CAN_RECORD) { $('admin-status').textContent = 'This browser can\'t record the microphone here.'; return }
+  const status = $('admin-status')
+  // The passphrase must never reach the browser's online speech service, or be shown or logged.
+  const wasListening = ears.wanted
+  ears.pause()
+  setState('active')
+  hear('')
+  status.textContent = 'Listening for your passphrase…'
+  activity('Admin check')
+  let blob = null
+  try {
+    blob = await recorder.capture({ startTimeout: 7000, maxMs: 10000, raw: true })
+  } catch (e) {
+    status.textContent = micProblem(e)
+  }
+  if (wasListening) ears.resume()
+  if (!blob) {
+    activity('')
+    setState(idleState())
+    if (!status.textContent.startsWith('Microphone')) status.textContent = 'I didn\'t hear anything. Tap Speak passphrase.'
+    return
+  }
+  setState('thinking')
+  status.textContent = 'Checking…'
+  activity('Verifying')
+  let j
+  try {
+    const r = await fetch(`/api/admin/verify?id=${encodeURIComponent(approval.id)}`, {
+      method: 'POST', headers: { 'Content-Type': blob.type || 'audio/webm' }, body: blob })
+    j = await r.json()
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`)
+  } catch (e) {
+    j = { ok: false, done: false, text: `Couldn't check it: ${e.message}` }
+  }
+  activity('')
+  if (j.ok) { chime(880, 0.1, 2); closeApproval() } else if (j.done) closeApproval()
+  else if ($('admin-status')) $('admin-status').textContent = j.text
+  showAnswer(j.text)
+  addLog('assistant', j.text, ['admin'])
+  refresh()
+  await mouth.say(j.text, { followUp: false })
+}
+
+let enrolling = null
+
+async function renderAdminBox() {
+  const box = $('admin-box')
+  box.replaceChildren()
+  let st
+  try { st = await api('/api/admin/status') } catch { return }
+  box.append(h('b', {}, 'Admin voice'))
+  const what = 'Deleting files and folders, uninstalling apps, creating files and folders, writing scripts and emptying the Recycle Bin need your secret passphrase, spoken in your voice.'
+  if (!st.can_enroll) {
+    box.append(h('p', { class: 'muted small' }, st.enrolled ? `On. ${what}` : 'Not set up yet. Set it up on the laptop, in Settings.'))
+    return
+  }
+  if (st.enrolled && !enrolling) {
+    box.append(h('p', { class: 'muted small' }, `On since ${new Date(st.enrolled_at * 1000).toLocaleDateString()}. ${what}`),
+      h('div', { class: 'admin-actions' },
+        h('button', { type: 'button', class: 'btn small', onclick: () => { enrolling = { step: 'phrase' }; renderAdminBox() } }, 'Set up again'),
+        h('button', { type: 'button', class: 'btn small danger', onclick: async () => {
+          if (!confirm('Remove your admin voice? Admin actions will stop working until you set it up again.')) return
+          await api('/api/admin/remove', { method: 'POST' }); renderAdminBox()
+        } }, 'Remove')))
+    return
+  }
+  if (!enrolling) {
+    box.append(h('p', { class: 'muted small' }, `Off. ${what} Set it up to allow them.`),
+      h('button', { type: 'button', class: 'btn small primary', onclick: () => { enrolling = { step: 'phrase' }; renderAdminBox() } }, 'Set up admin voice'))
+    return
+  }
+  if (enrolling.step === 'phrase') {
+    const input = h('input', { type: 'password', autocomplete: 'off', placeholder: 'e.g. blue falcon 729', 'aria-label': 'Secret passphrase' })
+    const msg = h('p', { class: 'muted small' }, 'Two or more words, or a word and a number: easy for you to say, hard to guess. Don\'t use it anywhere else, and don\'t say it near others.')
+    box.append(msg, h('div', { class: 'lan-row' }, input,
+      h('button', { type: 'button', class: 'btn small primary', onclick: async () => {
+        try {
+          await api('/api/admin/enroll/start', { method: 'POST', body: { passphrase: input.value } })
+          enrolling = { step: 'record', count: 0 }
+          renderAdminBox()
+        } catch (e) { msg.textContent = e.message }
+      } }, 'Next'),
+      h('button', { type: 'button', class: 'btn small', onclick: () => { enrolling = null; renderAdminBox() } }, 'Cancel')))
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); box.querySelector('.btn.primary')?.click() }
+    })
+    setTimeout(() => input.focus(), 50)
+    return
+  }
+  const msg = h('p', { class: 'small', 'aria-live': 'polite' }, `Say your passphrase in your normal voice. Sample ${enrolling.count + 1} of 5.`)
+  const dots = h('div', { class: 'enroll-dots' }, ...Array.from({ length: 5 }, (_, i) => h('span', { class: i < enrolling.count ? 'on' : '' })))
+  const rec = h('button', { type: 'button', class: 'btn small primary' }, 'Record')
+  rec.onclick = async () => {
+    rec.disabled = true
+    const wasListening = ears.wanted
+    ears.pause()
+    msg.textContent = 'Listening… say it now.'
+    let blob = null
+    try { blob = await recorder.capture({ startTimeout: 7000, maxMs: 10000, raw: true }) } catch (e) { msg.textContent = micProblem(e) }
+    if (wasListening) ears.resume()
+    if (!blob) { rec.disabled = false; if (!msg.textContent.startsWith('Microphone')) msg.textContent = 'I didn\'t hear anything. Press Record and say it.'; return }
+    msg.textContent = 'Checking…'
+    try {
+      const r = await fetch('/api/admin/enroll/sample', { method: 'POST', headers: { 'Content-Type': blob.type || 'audio/webm' }, body: blob })
+      const j = await r.json()
+      if (!r.ok) throw new Error(j.detail)
+      if (!j.ok) {
+        msg.textContent = `That didn't sound like your passphrase (I heard "${j.heard}"). Say it again, clearly.`
+        rec.disabled = false
+        return
+      }
+      enrolling.count = j.enrolling
+      if (enrolling.count >= 5) {
+        await api('/api/admin/enroll/finish', { method: 'POST' })
+        enrolling = null
+        toast('Admin voice', 'Saved. Admin actions now need your passphrase in your voice.')
+      }
+      renderAdminBox()
+    } catch (e) { msg.textContent = e.message; rec.disabled = false }
+  }
+  box.append(msg, dots, h('div', { class: 'admin-actions' }, rec,
+    h('button', { type: 'button', class: 'btn small', onclick: () => { enrolling = null; renderAdminBox() } }, 'Cancel')))
+}
+
+async function requestApproval(kind, args) {
+  try {
+    const r = await api('/api/admin/request', { method: 'POST', body: { kind, args } })
+    showAnswer(r.text)
+    showApproval(r.admin)
+    await mouth.say(r.text, { followUp: false })
+    approve()
+  } catch (e) {
+    toast('Admin', e.message)
+  }
 }
 
 function addLog(role, text, tools = [], ts = Date.now() / 1000) {
@@ -508,9 +697,12 @@ function renderCards(cards) {
     out.push(h('div', { class: 'card' }, h('h3', {}, 'Files found'),
       h('ul', {}, cards.files.map((f) => h('li', {},
         h('div', {}, f.name, h('div', { class: 'file-path' }, f.path)),
-        h('button', { class: 'btn small', onclick: async () => {
-          try { toast('Files', (await api('/api/open-file', { method: 'POST', body: { path: f.path } })).result) } catch (e) { toast('Files', e.message) }
-        } }, 'Open'))))))
+        h('span', { class: 'file-btns' },
+          h('button', { class: 'btn small', onclick: async () => {
+            try { toast('Files', (await api('/api/open-file', { method: 'POST', body: { path: f.path } })).result) } catch (e) { toast('Files', e.message) }
+          } }, 'Open'),
+          h('button', { class: 'btn small danger', title: 'Moves it to the Recycle Bin, after your admin voice',
+            onclick: () => requestApproval('delete_path', { path: f.path }) }, 'Delete')))))))
   }
   if (typeof cards.search === 'string') {
     out.push(h('div', { class: 'card' }, h('h3', {}, 'Web search'), h('pre', {}, cards.search)))
@@ -587,10 +779,12 @@ function renderSystem(s) {
     h('div', {}, 'Memory ', h('b', {}, `${s.ram_used_gb} / ${s.ram_total_gb} GB`)),
     h('div', {}, 'System drive free ', h('b', {}, `${s.disk_free_gb} GB`)),
     h('div', {}, 'Uptime ', h('b', {}, `${s.uptime_h} h`)))
+  FX.spark(s.cpu, s.ram)
 }
 
 function renderNetwork(n) {
   const el = $('network')
+  FX.setRadar(n ? n.online : 0, n ? (n.new || []).length : 0)
   if (!n) {
     el.replaceChildren(h('p', { class: 'muted small' }, 'Yolo Network Scanner isn\'t running. Start it to let JARVIS watch your Wi-Fi.'))
     return
@@ -655,6 +849,7 @@ async function refresh() {
     renderSystem(s.system)
     renderWeather(s.weather)
     renderNetwork(s.network)
+    FX.ticker(s.news)
     reminders = s.reminders
     renderReminders()
     renderNotes(s.notes)
@@ -686,10 +881,32 @@ function askNotify() {
   Notification.requestPermission().catch(() => {})
 }
 
+function jobDone(ev) {
+  chime(660, 0.12, 3)
+  toast(`${ev.helper} finished`, ev.task, false, 12000)
+  addLog('assistant', `${ev.helper}: ${ev.result}`, ['ai_code_job'])
+  const openPath = (p) => async () => {
+    try { toast('Files', (await api('/api/open-file', { method: 'POST', body: { path: p } })).result) } catch (e) { toast('Files', e.message) }
+  }
+  $('cards').prepend(h('div', { class: 'card job' },
+    h('h3', {}, `${ev.helper} · finished in ${ev.seconds}s`),
+    h('p', { class: 'admin-what' }, ev.task),
+    h('pre', {}, ev.result),
+    h('div', { class: 'admin-actions' },
+      h('button', { class: 'btn small', type: 'button', onclick: openPath(ev.folder) }, 'Open folder'),
+      h('button', { class: 'btn small', type: 'button', onclick: openPath(`${ev.folder}\\RESULT.txt`) }, 'Open result'))))
+  if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+    new Notification('J.A.R.V.I.S.', { body: ev.say })
+  }
+  const wait = () => (busy || mouth.speaking || recorder.active ? setTimeout(wait, 500) : mouth.say(ev.say, { followUp: false }))
+  setTimeout(wait, 600)
+}
+
 function listen() {
   const es = new EventSource('/api/events')
   es.onmessage = async (m) => {
     const ev = JSON.parse(m.data)
+    if (ev.type === 'job') { jobDone(ev); return }
     if (ev.type !== 'reminder') return
     const line = ev.kind === 'timer' ? `${You()}, your ${ev.text} is done.` : `${You()}, a reminder: ${ev.text}.`
     chime(880, 0.14, 4)
@@ -726,6 +943,8 @@ async function openSettings() {
     h('option', { value: 'wake', disabled: !SRok }, `Always listen for "Jarvis"${SRok ? '' : ' (needs Chrome or Edge)'}`),
     h('option', { value: 'tap', disabled: !CAN_RECORD }, 'Tap to talk, then hands-free follow-ups (best on phones)'))
   sel.value = pickMode() === 'type' ? 'tap' : pickMode()
+  enrolling = null
+  renderAdminBox()
   const box = $('lan-box')
   box.replaceChildren()
   try {
@@ -830,6 +1049,7 @@ $('btn-mute').addEventListener('click', () => {
   renderMute()
 })
 $('btn-settings').addEventListener('click', openSettings)
+$('btn-theme').addEventListener('click', () => FX.nextTheme())
 $('btn-new').addEventListener('click', async () => {
   await api('/api/new-session', { method: 'POST' })
   loadHistory()
@@ -877,6 +1097,7 @@ function partOfDay() {
 
 /* ---------------- boot ---------------- */
 async function boot() {
+  FX.init()
   const log = $('boot-log')
   const line = async (text, ms = 260) => { log.textContent += `${text}\n`; await new Promise((r) => setTimeout(r, ms)) }
   tickClock()

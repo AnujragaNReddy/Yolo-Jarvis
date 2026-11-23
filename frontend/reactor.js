@@ -2,7 +2,7 @@
 const Reactor = (() => {
   const canvas = document.getElementById('reactor')
   const ctx = canvas.getContext('2d')
-  const COLORS = {
+  let COLORS = {
     standby: [0, 216, 255], active: [108, 233, 255], thinking: [255, 181, 71], speaking: [61, 255, 220], off: [71, 107, 128],
   }
   let state = 'standby'
@@ -148,6 +148,44 @@ const Reactor = (() => {
     ctx.stroke()
     ctx.restore()
 
+    // orbiting particles with fading trails
+    ctx.save()
+    ctx.translate(cx, cx)
+    for (let k = 0; k < 3; k++) {
+      const base = s * (0.9 + k * 0.35) + (k * Math.PI * 2) / 3
+      const rr = R * (0.89 - k * 0.04)
+      for (let tr = 0; tr < 10; tr++) {
+        const a = base - tr * 0.045
+        ctx.beginPath()
+        ctx.arc(Math.cos(a) * rr, Math.sin(a) * rr, (3.2 - tr * 0.28) * dpr, 0, Math.PI * 2)
+        ctx.fillStyle = rgba(0.9 - tr * 0.085)
+        ctx.fill()
+      }
+    }
+    ctx.restore()
+
+    // energy arcs while thinking
+    if (state === 'thinking' && !reduced && Math.random() < 0.55) {
+      ctx.save()
+      ctx.translate(cx, cx)
+      for (let k = 0; k < 2; k++) {
+        const a = Math.random() * Math.PI * 2
+        let r = R * 0.47
+        ctx.beginPath()
+        ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r)
+        let aa = a
+        while (r < R * 0.8) {
+          r += R * (0.04 + Math.random() * 0.05)
+          aa += (Math.random() - 0.5) * 0.25
+          ctx.lineTo(Math.cos(aa) * r, Math.sin(aa) * r)
+        }
+        ctx.strokeStyle = rgba(0.55 + Math.random() * 0.45)
+        ctx.lineWidth = (1 + Math.random() * 1.5) * dpr
+        ctx.stroke()
+      }
+      ctx.restore()
+    }
+
     // core
     const pulse = state === 'standby' ? 0.04 * Math.sin(t * 2) : 0
     const cr = R * (0.2 + level * 0.07 + pulse)
@@ -168,6 +206,7 @@ const Reactor = (() => {
 
   return {
     setState(next) { state = next },
+    setPalette(p) { COLORS = { ...COLORS, ...p } },
     pushLevel(v) { target = Math.max(target, Math.min(1, v)) },
   }
 })()

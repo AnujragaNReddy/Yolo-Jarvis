@@ -50,8 +50,8 @@ def _groq(audio: bytes, lang: str, mime: str) -> str:
     return r.json().get("text", "").strip()
 
 
-def transcribe(audio: bytes, lang: str = "en", mime: str = "audio/webm") -> str:
-    if config.GROQ_API_KEY:
+def transcribe(audio: bytes, lang: str = "en", mime: str = "audio/webm", local_only: bool = False) -> str:
+    if config.GROQ_API_KEY and not local_only:
         try:
             text = _groq(audio, lang, mime)
             return "" if PHANTOMS.match(text) else text

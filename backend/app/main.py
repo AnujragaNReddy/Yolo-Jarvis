@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import access, brain, config, db, stt, tts
+from . import access, admin, brain, config, db, stt, tts
 from .tools import info, memory, network, system, timers
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
@@ -42,8 +42,16 @@ async def _reminder_loop():
                 q.put_nowait(event)
 
 
+def _broadcast(event: dict) -> None:
+    for q in list(_listeners):
+        q.put_nowait(event)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from .tools import coders
+
+    coders.notify = _broadcast
     db.conn()
     tasks = [asyncio.create_task(_reminder_loop()), asyncio.create_task(brain.warm_up()),
              asyncio.create_task(asyncio.to_thread(system.warm)), asyncio.create_task(asyncio.to_thread(stt.warm))]
@@ -72,7 +80,8 @@ async def guard(request: Request, call_next):
     if origin and origin.split("://", 1)[-1] != host:
         return JSONResponse({"detail": "Requests from other websites are refused."}, status_code=403)
     ctype = request.headers.get("content-type", "")
-    wanted = ("audio/", "application/octet-stream") if request.url.path == "/api/stt" else ("application/json",)
+    audio_paths = ("/api/stt", "/api/admin/verify", "/api/admin/enroll/sample")
+    wanted = ("audio/", "application/octet-stream") if request.url.path in audio_paths else ("application/json",)
     if request.method in ("POST", "PUT", "PATCH") and not ctype.startswith(wanted):
         return JSONResponse({"detail": "Wrong content type."}, status_code=415)
     # Public, harmless files: the certificate a phone installs before opening the link, and the home-screen icon
@@ -164,7 +173,9 @@ async def events(request: Request):
 async def status():
     weather = await _cached("weather", 600, info.get_weather)
     net = await _cached("network", 60, network.summary)
+    news = await _cached("news", 900, info.get_news)
     return {
+        "news": news or [],
         "system": system.stats(),
         "weather": weather,
         "network": net,
@@ -215,6 +226,111 @@ async def speech_to_text(request: Request):
     except Exception as e:
         raise HTTPException(500, f"Couldn't understand the recording: {e}")
     return {"text": text}
+
+
+def _local(request: Request) -> bool:
+    return access.is_local(request.client.host if request.client else None)
+
+
+async def _audio(request: Request) -> bytes:
+    audio = await request.body()
+    if not audio or len(audio) > 4_000_000:
+        raise HTTPException(400, "Send a short recording.")
+    return audio
+
+
+class EnrollBody(BaseModel):
+    passphrase: str
+
+
+class AdminRequestBody(BaseModel):
+    kind: str
+    args: dict = {}
+
+
+@app.get("/api/admin/status")
+async def admin_status(request: Request):
+    return {**admin.status(), "can_enroll": _local(request)}
+
+
+@app.post("/api/admin/enroll/start")
+async def admin_enroll_start(body: EnrollBody, request: Request):
+    # Only at the laptop itself: someone holding the phone link must not be able to enroll their own voice.
+    if not _local(request):
+        raise HTTPException(403, "Admin voice can only be set up on the laptop.")
+    try:
+        return admin.enroll_start(body.passphrase)
+    except admin.Refused as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/enroll/sample")
+async def admin_enroll_sample(request: Request):
+    if not _local(request):
+        raise HTTPException(403, "Admin voice can only be set up on the laptop.")
+    audio = await _audio(request)
+    try:
+        return await asyncio.to_thread(admin.enroll_sample, audio)
+    except admin.Refused as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/enroll/finish")
+async def admin_enroll_finish(request: Request):
+    if not _local(request):
+        raise HTTPException(403, "Admin voice can only be set up on the laptop.")
+    try:
+        return admin.enroll_finish()
+    except admin.Refused as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/admin/remove")
+async def admin_remove(request: Request):
+    if not _local(request):
+        raise HTTPException(403, "Admin voice can only be removed on the laptop.")
+    return admin.remove()
+
+
+@app.post("/api/admin/request")
+async def admin_request(body: AdminRequestBody):
+    """For buttons on the HUD (e.g. Delete on a file card): plans the change and asks for approval."""
+    from .tools import TOOLS, files
+
+    if body.kind not in files.PLANNERS:
+        raise HTTPException(400, "Unknown action.")
+    try:
+        plan = await asyncio.to_thread(TOOLS[body.kind]["fn"], **body.args)
+        return brain._approval(plan)
+    except admin.Refused as e:
+        raise HTTPException(400, str(e))
+    except TypeError:
+        raise HTTPException(400, "Bad request.")
+
+
+@app.post("/api/admin/verify")
+async def admin_verify(request: Request, id: str):
+    from .tools import files
+
+    audio = await _audio(request)
+    ok, message, plan = await asyncio.to_thread(admin.verify, id, audio)
+    if not ok:
+        return {"ok": False, "done": "locked" in message or "expired" in message or "isn't set up" in message,
+                "text": message}
+    try:
+        result = await files.execute(plan)
+    except admin.Refused as e:
+        result = f"I stopped: {e}"
+    except Exception as e:
+        result = f"That didn't work: {e}"
+    db.add_history("assistant", f"Admin approved: {plan['summary']}. {result}", json.dumps(["admin"]))
+    return {"ok": True, "done": True, "text": result}
+
+
+@app.post("/api/admin/cancel")
+async def admin_cancel(body: dict):
+    admin.cancel(str(body.get("id", "")))
+    return {"ok": True}
 
 
 @app.get("/jarvis-ca.crt")

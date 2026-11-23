@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import re
 import time
@@ -7,8 +8,8 @@ from typing import AsyncIterator
 
 import httpx
 
-from . import config, db, intents
-from .tools import TOOLS, memory, run, schemas
+from . import admin, config, db, intents
+from .tools import TOOLS, files, memory, run, schemas
 
 LABELS = {
     "get_time": "Checking the clock", "get_weather": "Reading the weather", "web_search": "Searching the web",
@@ -20,7 +21,17 @@ LABELS = {
     "forget": "Erasing memory", "add_note": "Updating your list", "list_notes": "Reading your list",
     "complete_note": "Updating your list", "set_timer": "Starting timer", "set_reminder": "Scheduling reminder",
     "list_reminders": "Checking schedule", "cancel_reminder": "Cancelling", "network_devices": "Scanning network",
+    "delete_path": "Preparing deletion", "create_folder": "Preparing folder", "create_file": "Preparing file",
+    "write_script": "Preparing script", "uninstall_app": "Finding the app", "brightness": "Adjusting brightness",
+    "screenshot": "Taking a screenshot", "ask_ai": "Consulting another AI", "ai_code_job": "Preparing a coding job",
 }
+
+
+def _approval(plan: dict) -> dict:
+    """Turns a planned change into an admin request: the answer says exactly what will happen and asks for the
+    owner's passphrase. Raises admin.Refused when admin voice isn't set up."""
+    ch = admin.request(plan)
+    return {"text": f"{plan['summary']}. Say your passphrase to approve.", "admin": ch}
 
 # Tool results the HUD shows as cards alongside the spoken answer.
 CARD_TOOLS = {"get_weather": "weather", "get_news": "news", "find_files": "files", "system_status": "system",
@@ -47,6 +58,10 @@ directly from your own knowledge, without a tool
 - any arithmetic or percentages -> calculate
 - finding documents, photos or files on the PC -> find_files, then open_file with a path it returned
 - opening apps, sites, music, timers, reminders, lists, volume, the home network -> the matching tool
+- "ask Claude" / "ask Gemini", or a hard coding question -> ask_ai; writing code AND running it -> ai_code_job
+- deleting a file or folder -> find_files first, then delete_path with the exact path it returned
+- creating files or folders, writing a script or program, uninstalling an app -> create_file, create_folder, \
+write_script, uninstall_app. These are only carried out after the owner approves by voice, so never say they are done.
 - the user TELLS you a new lasting fact about themselves (a statement, not a question) -> remember
 Answer jokes, opinions and chat yourself; answer questions about the user from the "Known about the user" context.
 Search results mix old and new pages: for "latest" or "most recent" questions, use the result with the newest date, \
@@ -187,8 +202,16 @@ async def handle(text: str) -> AsyncIterator[dict]:
         quick = {"text": f"That didn't work: {e}", "tool": "error", "cards": {}}
     if quick:
         yield {"type": "tool", "name": quick["tool"], "label": LABELS.get(quick["tool"], "Working")}
+        approval = None
+        if quick.get("plan"):
+            try:
+                approval = _approval(quick["plan"])
+                quick["text"] = approval["text"]
+            except admin.Refused as e:
+                quick["text"] = str(e)
         db.add_history("assistant", quick["text"], json.dumps([quick["tool"]]))
-        yield {"type": "answer", "text": quick["text"], "cards": quick["cards"], "tools": [quick["tool"]], "fast": True}
+        yield {"type": "answer", "text": quick["text"], "cards": quick["cards"], "tools": [quick["tool"]], "fast": True,
+               "admin": approval["admin"] if approval else None}
         return
 
     yield {"type": "thinking"}
@@ -201,9 +224,11 @@ async def handle(text: str) -> AsyncIterator[dict]:
     messages = [{"role": "system", "content": system_prompt()},
                 {"role": "user", "content": f"{text}\n\n{context_note()}{recap}"}]
 
-    used, cards, answer = [], {}, ""
+    used, cards, answer, approval = [], {}, "", None
     try:
         for round_no in range(config.MAX_TOOL_ROUNDS + 1):
+            if approval:
+                break
             msg = await _llm(messages, use_tools=round_no < config.MAX_TOOL_ROUNDS)
             calls = msg.get("tool_calls") or []
             content = _tidy(msg.get("content") or "")
@@ -221,8 +246,23 @@ async def handle(text: str) -> AsyncIterator[dict]:
                 fn = call.get("function", {})
                 name, args = fn.get("name", ""), fn.get("arguments") or {}
                 yield {"type": "tool", "name": name, "label": LABELS.get(name, name), "args": args}
-                result = await asyncio.to_thread(run, name, args) if name in TOOLS else f"Unknown tool {name}."
                 used.append(name)
+                if name in files.PLANNERS:
+                    # Changes to the PC are only planned here; the owner approves the exact plan by voice.
+                    try:
+                        fn = TOOLS[name]["fn"]
+                        accepted = inspect.signature(fn).parameters
+                        plan = await asyncio.to_thread(fn, **{k: v for k, v in args.items() if k in accepted and v is not None})
+                        approval = _approval(plan)
+                        answer = approval["text"]
+                        break
+                    except admin.Refused as e:
+                        result = str(e)
+                    except TypeError as e:
+                        result = f"Bad arguments for {name}: {e}"
+                    messages.append({"role": "tool", "content": result, "tool_name": name, "tool_call_id": call["id"]})
+                    continue
+                result = await asyncio.to_thread(run, name, args) if name in TOOLS else f"Unknown tool {name}."
                 card = _card(name, result)
                 if card:
                     cards[card[0]] = card[1]
@@ -237,7 +277,38 @@ async def handle(text: str) -> AsyncIterator[dict]:
 
     answer = answer or f"I'm afraid I have nothing useful to say to that, {intents.you()}."
     db.add_history("assistant", answer, json.dumps(used) if used else None)
-    yield {"type": "answer", "text": answer, "cards": cards, "tools": used, "fast": False}
+    yield {"type": "answer", "text": answer, "cards": cards, "tools": used, "fast": False,
+           "admin": approval["admin"] if approval else None}
+
+
+async def write_code(task: str, language: str) -> str:
+    """The script itself, for an approved write_script. Not run, only saved and opened for review."""
+    messages = [{"role": "system", "content": (
+        f"You are an expert {language} programmer. Write one complete, working {language} file for the task. "
+        "Start with a short comment saying what it does and how to run it. Keep it simple and safe: no deleting "
+        "files, no system changes, no network calls unless the task needs them. Reply with only the code, no "
+        "explanations and no markdown fences.")},
+        {"role": "user", "content": task}]
+    if provider() == "groq":
+        try:
+            r = await _http.post(f"{config.GROQ_URL}/chat/completions", timeout=60,
+                                 headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+                                 json={"model": config.GROQ_MODEL, "messages": messages, "temperature": 0.2,
+                                       "max_tokens": 3000})
+            r.raise_for_status()
+            code = r.json()["choices"][0]["message"]["content"]
+        except (httpx.HTTPError, KeyError, ValueError):
+            code = None
+    else:
+        code = None
+    if code is None:
+        r = await _http.post(f"{config.OLLAMA_URL}/api/chat", timeout=600, json={
+            "model": db.setting("model"), "messages": messages, "stream": False, "keep_alive": _keep_alive(),
+            "options": {"temperature": 0.2, "num_ctx": 6144, "num_predict": 1800}})
+        r.raise_for_status()
+        code = r.json()["message"]["content"]
+    code = re.sub(r"^\s*```[\w+#-]*\s*\n|\n?```\s*$", "", code.strip())
+    return code.rstrip() + "\n"
 
 
 async def warm_up() -> None:

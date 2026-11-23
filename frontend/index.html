@@ -18,7 +18,9 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <canvas id="bg" class="bg" aria-hidden="true"></canvas>
   <div class="grid-bg" aria-hidden="true"></div>
+  <div class="scanlines" aria-hidden="true"></div>
 
   <div id="boot" class="boot">
     <div class="boot-inner">
@@ -45,6 +47,7 @@
       <span class="chip" id="chip-voice" title="Voice">VOICE —</span>
     </div>
     <div class="top-actions">
+      <button class="theme-btn" id="btn-theme" title="Change theme" aria-label="Change colour theme">JARVIS</button>
       <button class="icon-btn" id="btn-mute" title="Voice on/off (M)" aria-label="Voice on or off"></button>
       <button class="icon-btn" id="btn-new" title="New conversation" aria-label="New conversation">
         <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
@@ -74,12 +77,19 @@
       <section class="panel">
         <div class="panel-k">// system diagnostics</div>
         <div class="gauges" id="gauges"></div>
+        <div class="sparks">
+          <div class="spark"><span>CPU · last 4 min</span><b id="spark-cpu-v">—</b><canvas id="spark-cpu" aria-hidden="true"></canvas></div>
+          <div class="spark"><span>RAM · last 4 min</span><b id="spark-ram-v">—</b><canvas id="spark-ram" aria-hidden="true"></canvas></div>
+        </div>
         <div class="sys-meta" id="sys-meta"></div>
       </section>
 
       <section class="panel">
         <div class="panel-k">// home network</div>
-        <div id="network"><p class="muted">Checking…</p></div>
+        <div class="net-row">
+          <canvas id="radar" class="radar" aria-hidden="true"></canvas>
+          <div id="network"><p class="muted">Checking…</p></div>
+        </div>
       </section>
     </aside>
 
@@ -151,6 +161,7 @@
         <label>Brain (Ollama model)<select name="model" id="model-select"></select></label>
         <label class="wide">Listening on this device<select id="listen-mode"></select></label>
       </div>
+      <div class="lan-box" id="admin-box"></div>
       <div class="lan-box" id="lan-box"></div>
       <p class="muted small">Everything stays on this PC, except: the voice (Microsoft's free online voices), the "Jarvis" wake word (your browser's own speech service; tap to talk is transcribed on this PC instead), and web searches, weather and news.</p>
       <div class="dialog-actions">
@@ -164,7 +175,13 @@
 
   <div class="toasts" id="toasts" aria-live="assertive"></div>
 
+  <footer class="ticker" aria-label="Headlines">
+    <span class="ticker-tag">LIVE</span>
+    <div class="ticker-view"><div class="ticker-track" id="ticker-track"></div></div>
+  </footer>
+
   <script src="reactor.js"></script>
+  <script src="fx.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

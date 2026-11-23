@@ -235,7 +235,7 @@ def _search_roots() -> list[Path]:
                                              "OneDrive")) if p.exists()]
 
 
-@tool("Find files on this PC by name (Desktop, Documents, Downloads, Pictures, Music, Videos).",
+@tool("Find files and folders on this PC by name (Desktop, Documents, Downloads, Pictures, Music, Videos).",
       name="string: part of the file name")
 def find_files(name: str) -> list[dict] | str:
     needle = name.lower().strip()
@@ -243,6 +243,11 @@ def find_files(name: str) -> list[dict] | str:
     for root in _search_roots():
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith((".", "node_modules", "AppData", "$"))]
+            for d in dirnames:
+                if needle in d.lower():
+                    p = Path(dirpath) / d
+                    found.append({"name": d + "\\", "path": str(p), "folder": True,
+                                  "modified": time.strftime("%Y-%m-%d", time.localtime(p.stat().st_mtime))})
             for f in filenames:
                 if needle in f.lower():
                     p = Path(dirpath) / f

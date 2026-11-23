@@ -10,7 +10,8 @@ import time
 from datetime import datetime
 
 from . import db
-from .tools import info, memory, network, system, timers
+from .admin import Refused
+from .tools import coders, files, info, memory, network, system, timers
 
 _pending: dict = {}
 
@@ -38,8 +39,9 @@ def _minutes(n: str, unit: str) -> float:
 def clean(text: str) -> str:
     t = text.lower().strip().replace("’", "'").replace("a.m.", "am").replace("p.m.", "pm")
     t = re.sub(r"[^\w\s:%'.-]", " ", t)
-    t = re.sub(r"\b(hey |ok |okay )?jarvis\b", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" .,")
+    # The wake word only at the start or end: "create a folder called Jarvis notes" keeps it.
+    t = re.sub(r"^((hey|hi|ok|okay) )?jarvis\b[ .,]*|[ .,]*\bjarvis$", "", t).strip(" .,")
     t = re.sub(r"^(please |can you |could you |would you |will you |i want you to |i need you to )+", "", t)
     t = re.sub(r"( please| for me| now| right now| thanks| thank you)+$", "", t)
     return t.strip(" .")
@@ -92,6 +94,13 @@ def _r(text: str, tool: str, **cards) -> dict:
     return {"text": text, "tool": tool, "cards": cards}
 
 
+def _plan(make, tool: str) -> dict:
+    try:
+        return {"text": "", "tool": tool, "cards": {}, "plan": make()}
+    except Refused as e:
+        return _r(str(e), tool)
+
+
 def match(raw: str) -> dict | None:
     t = clean(raw)
     if not t:
@@ -119,11 +128,45 @@ def match(raw: str) -> dict | None:
     if re.fullmatch(r"(go to |put (the |my )?(computer|pc|laptop) to )?sleep|sleep (mode|the (computer|pc|laptop))", t):
         return ask(f"Put the computer to sleep, {you()}?", system.sleep, "power")
     if re.search(r"\b(recycle|recylce|recyle|recycling) ?bin\b|\btrash\b", t) and re.search(r"\b(empty|clear|clean|delete|remove)\b", t):
-        n = system.recycle_bin_count()
-        if not n:
-            return _r(f"The Recycle Bin is already empty, {you()}.", "recycle_bin")
-        return ask(f"Empty the Recycle Bin? That permanently deletes {n} item{'s' if n != 1 else ''}.",
-                   system.empty_recycle_bin, "recycle_bin")
+        return _plan(files.plan_empty_recycle_bin, "recycle_bin")
+
+    if m := re.fullmatch(r"(ask|tell|get|have|let) (?P<who>claude|gemini|chatgpt|chat gpt|gpt|codex)( code| cli)?( to| about|,|:)? (?P<q>.+)", t):
+        who = m.group("who").replace(" ", "")
+        q = re.search(rf"(?:{m.group('who')})(?: code| cli)?(?: to| about|,|:)? (.+)$", raw, re.I)
+        q = q.group(1).strip() if q else m.group("q")
+        if re.search(r"\b(run|execute|test it|and run|try it)\b", m.group("q")):
+            return _plan(lambda: coders.ai_code_job(q, who), "ai_code_job")
+        try:
+            return _r(coders.ask_ai(q, who), "ask_ai")
+        except Refused as e:
+            return _r(str(e), "ask_ai")
+
+    # Changes that need the admin voice: these only plan; brain.py asks for approval.
+    if m := re.fullmatch(r"(uninstall|remove|delete) (the )?(app |application |program )?(?P<name>[\w\s.'+&-]+?)( app| application| program)?( from (my |the |this )?(pc|computer|laptop))?", t):
+        if m.group(1) == "uninstall" or m.group(3) or m.group(5):
+            return _plan(lambda: files.uninstall_app(m.group("name")), "uninstall_app")
+    if m := re.fullmatch(r"(create|make|add) (a )?(new )?folder (called |named )?(?P<name>[\w\s.'-]+?)( (on|in|inside) (the |my )?(?P<loc>desktop|documents|downloads|pictures|music|videos|home)( folder)?)?", t):
+        name = re.search(re.escape(m.group("name")), raw, re.I)  # keep the user's capitals
+        return _plan(lambda: files.create_folder(name.group(0) if name else m.group("name"), m.group("loc") or "documents"),
+                     "create_folder")
+    if m := re.fullmatch(r"(write|create|make|code) (me )?(a |an )?(?P<lang>python|javascript|powershell|html|java|c\+\+|go|bash|batch|sql|react)? ?(script|program|code|file|app) (that |which |to |for )(?P<task>.+)", t):
+        task = re.search(r"(?:that|which|to|for) (.+)$", raw, re.I)
+        return _plan(lambda: files.write_script(task.group(1) if task else m.group("task"), m.group("lang") or "python"),
+                     "write_script")
+    if m := re.fullmatch(r"(delete|remove|trash) (the |my )?(file|folder|document|photo|picture|video) (called |named )?(?P<name>.+)", t):
+        found = system.find_files(m.group("name"))
+        if isinstance(found, str):
+            return _r(f"I couldn't find a file called {m.group('name')}.", "find_files")
+        want = m.group("name").lower()
+        kind = m.group(3)
+        found = [f for f in found if (kind == "folder") == bool(f.get("folder"))] if kind in ("file", "folder") else found
+        if not found:
+            return _r(f"I couldn't find a {kind} called {m.group('name')}.", "find_files")
+        exact = [f for f in found if f["name"].lower().rstrip("\\").split(".")[0] == want or f["name"].lower().rstrip("\\") == want]
+        if len(found) == 1 or len(exact) == 1:
+            target = (exact or found)[0]["path"]
+            return _plan(lambda: files.delete_path(target), "delete_path")
+        return _r(f"I found {len(found)} matches. Tap Delete next to the one you mean.", "find_files", files=found)
     if re.search(r"\b(recycle|recyle|recylce) ?bin\b", t):
         n = system.recycle_bin_count()
         return _r(f"The Recycle Bin has {n} item{'s' if n != 1 else ''}." if n else "The Recycle Bin is empty.", "recycle_bin")
