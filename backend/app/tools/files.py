@@ -193,7 +193,8 @@ def plan_empty_recycle_bin() -> dict:
     return _plan("empty_recycle_bin", f"Permanently delete the {n} item{'s' if n != 1 else ''} in the Recycle Bin")
 
 
-PLANNERS = {"delete_path", "create_folder", "create_file", "write_script", "uninstall_app", "ai_code_job"}
+PLANNERS = {"delete_path", "create_folder", "create_file", "write_script", "uninstall_app", "ai_code_job",
+            "phone_uninstall_app"}
 
 
 def _code_cli() -> str | None:
@@ -260,6 +261,10 @@ async def execute(plan: dict) -> str:
         return f"Started the {app['name']} uninstaller. Follow its window to finish."
     if kind == "empty_recycle_bin":
         return empty_recycle_bin()
+    if kind == "phone_uninstall":
+        from .phone import uninstall
+
+        return uninstall(a)
     if kind == "ai_code":
         from .coders import start_job
 

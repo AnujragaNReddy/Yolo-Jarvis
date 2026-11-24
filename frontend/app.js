@@ -340,8 +340,19 @@ function idleState() {
   return mode === 'wake' && !ears.wanted ? 'off' : 'standby'
 }
 
+// First sentence alone (short = fast to make), then groups of up to ~220 characters.
+function chunks(text) {
+  const sentences = text.replace(/\s+/g, ' ').trim().match(/[^.!?]+[.!?]+["')\]]*|[^.!?]+$/g) || [text]
+  const out = []
+  for (const s of sentences.map((x) => x.trim()).filter(Boolean)) {
+    if (out.length > 1 && (out[out.length - 1] + ' ' + s).length <= 220) out[out.length - 1] += ' ' + s
+    else out.push(s)
+  }
+  return out
+}
+
 const mouth = {
-  speaking: false, src: null, done: null,
+  speaking: false, src: null, done: null, abort: null,
 
   async say(text, { voice, followUp = true } = {}) {
     if (!text) return
@@ -350,17 +361,31 @@ const mouth = {
     this.speaking = true
     ears.pause()
     setState('speaking')
+    // Sentence by sentence: the first plays as soon as it's ready while the rest are made in parallel, and a
+    // slow voice service (it sometimes takes 10 s+) hands over to the browser's own voice instead of going silent.
+    const parts = chunks(text)
+    const ctrl = new AbortController()
+    this.abort = ctrl
+    const fetchPart = (t) => fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: t, voice: voice || settings.voice }), signal: ctrl.signal })
+      .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error('tts'))))
+    const pending = parts.map(fetchPart)
+    pending.forEach((p) => p.catch(() => {}))
     try {
-      const r = await fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: voice || settings.voice }) })
-      if (!r.ok) throw new Error('tts')
-      const data = await r.arrayBuffer()
-      if (!this.speaking) return
-      await this.play(data)
-      chip('chip-voice', 'VOICE: NEURAL', 'ok')
+      for (let i = 0; i < parts.length && this.speaking; i++) {
+        const limit = i === 0 ? 4000 : 8000
+        const data = await Promise.race([pending[i], new Promise((_, no) => setTimeout(() => no(new Error('slow')), limit))])
+        if (!this.speaking) break
+        await this.play(data)
+        chip('chip-voice', 'VOICE: NEURAL', 'ok')
+        parts[i] = ''
+      }
     } catch {
-      if (this.speaking) { chip('chip-voice', 'VOICE: BROWSER', 'warn'); await this.browser(text) }
+      ctrl.abort()
+      const rest = parts.filter(Boolean).join(' ')
+      if (this.speaking && rest) { chip('chip-voice', 'VOICE: BROWSER', 'warn'); await this.browser(rest) }
     } finally {
+      this.abort = null
       this.speaking = false
       ears.resume()
       this.after(followUp)
@@ -423,6 +448,7 @@ const mouth = {
   stop() {
     const was = this.speaking
     this.speaking = false
+    if (this.abort) { this.abort.abort(); this.abort = null }
     if (this.src) { try { this.src.stop() } catch { /* already ended */ } this.src = null }
     try { speechSynthesis.cancel() } catch { /* none */ }
     if (this.done) { this.done(); this.done = null }
@@ -782,6 +808,69 @@ function renderSystem(s) {
   FX.spark(s.cpu, s.ram)
 }
 
+let phoneForm = false
+
+function phoneResult(r) {
+  toast('Phone', r.text)
+  addLog('assistant', r.text, ['phone'])
+  if (r.phone?.connected) phoneForm = false
+  renderPhone(r.phone, true)
+}
+
+function renderPhone(p, force = false) {
+  const el = $('phone')
+  if (phoneForm && !force) return // don't wipe the pairing form while it's being filled in
+  if (!p) { el.replaceChildren(h('p', { class: 'muted small' }, 'Checking…')); return }
+  if (!p.connected) {
+    const tone = { not_paired: 'warn', debugging_off: 'warn', unreachable: '', not_set_up: '' }[p.problem] || ''
+    const kids = [h('p', { class: `small phone-problem ${tone}` }, p.message)]
+    if (p.problem !== 'no_adb') {
+      const reconnect = h('button', { type: 'button', class: 'btn small' }, 'Reconnect')
+      reconnect.onclick = async () => {
+        reconnect.disabled = true
+        reconnect.textContent = 'Searching…'
+        try { phoneResult(await api('/api/phone/connect', { method: 'POST' })) } catch (e) { toast('Phone', e.message) }
+        reconnect.disabled = false
+        reconnect.textContent = 'Reconnect'
+      }
+      kids.push(h('div', { class: 'admin-actions' }, reconnect,
+        h('button', { type: 'button', class: 'btn small primary', onclick: () => { phoneForm = !phoneForm; renderPhone(p, true) } },
+          phoneForm ? 'Close' : 'Pair phone')))
+    }
+    if (phoneForm) {
+      const addr = h('input', { placeholder: `${p.ip || '192.168.1.20'}:40447`, 'aria-label': 'IP address and port from the pairing box', inputmode: 'decimal' })
+      const code = h('input', { placeholder: '6-digit code', 'aria-label': 'Pairing code', inputmode: 'numeric', maxlength: '7' })
+      const go = h('button', { type: 'submit', class: 'btn small primary' }, 'Pair')
+      const form = h('form', { class: 'pair-form' },
+        h('p', { class: 'muted small' }, 'On the phone: Developer options → Wireless debugging → Pair device with pairing code. Type what it shows, quickly: the code expires in about a minute.'),
+        addr, code, go)
+      form.onsubmit = async (e) => {
+        e.preventDefault()
+        let a = addr.value.trim()
+        if (/^\d{4,5}$/.test(a) && p.ip) a = `${p.ip}:${a}` // just the port typed
+        go.disabled = true
+        go.textContent = 'Pairing…'
+        try { phoneResult(await api('/api/phone/pair', { method: 'POST', body: { address: a, code: code.value } })) } catch (err) {
+          toast('Phone', err.message)
+          go.disabled = false
+          go.textContent = 'Pair'
+        }
+      }
+      kids.push(form)
+      setTimeout(() => addr.focus(), 30)
+    }
+    el.replaceChildren(...kids)
+    return
+  }
+  el.replaceChildren(
+    h('div', { class: 'phone-row' },
+      gauge(p.charging ? 'CHARGING' : 'BATTERY', p.battery, null, true),
+      h('div', {},
+        h('b', { class: 'phone-name' }, `${(p.maker || '').toUpperCase()} ${p.model || ''}`),
+        h('div', { class: 'muted small' }, `Android ${p.android} · linked`),
+        h('div', { class: 'muted small' }, 'Try "open YouTube on my phone"'))))
+}
+
 function renderNetwork(n) {
   const el = $('network')
   FX.setRadar(n ? n.online : 0, n ? (n.new || []).length : 0)
@@ -849,6 +938,7 @@ async function refresh() {
     renderSystem(s.system)
     renderWeather(s.weather)
     renderNetwork(s.network)
+    renderPhone(s.phone)
     FX.ticker(s.news)
     reminders = s.reminders
     renderReminders()

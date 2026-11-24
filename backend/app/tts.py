@@ -1,4 +1,5 @@
 import re
+from collections import OrderedDict
 
 import edge_tts
 
@@ -22,16 +23,31 @@ def speakable(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()[:1500]
 
 
+# Recent phrases ("Yes, sir?", greetings, "Timer set for 5 minutes.") come straight from memory.
+_cache: OrderedDict[tuple[str, str], bytes] = OrderedDict()
+CACHE_SIZE = 150
+
+
 async def synth(text: str, voice: str) -> bytes:
     if voice not in {v["id"] for v in VOICES}:
         voice = VOICES[0]["id"]
+    text = speakable(text)
+    if (voice, text) in _cache:
+        _cache.move_to_end((voice, text))
+        return _cache[(voice, text)]
     for attempt in range(2):  # the free voice service drops a request now and then
         out = bytearray()
         try:
-            async for chunk in edge_tts.Communicate(speakable(text), voice, rate="+4%", pitch="-2Hz").stream():
+            # No rate/pitch change: adjusting prosody made the service take ~1.5 s longer per sentence.
+            async for chunk in edge_tts.Communicate(text, voice).stream():
                 if chunk["type"] == "audio":
                     out += chunk["data"]
-            return bytes(out)
+            audio = bytes(out)
+            if audio and len(text) <= 300:
+                _cache[(voice, text)] = audio
+                while len(_cache) > CACHE_SIZE:
+                    _cache.popitem(last=False)
+            return audio
         except edge_tts.exceptions.NoAudioReceived:
             if attempt:
                 raise

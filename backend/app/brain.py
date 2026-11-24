@@ -24,6 +24,10 @@ LABELS = {
     "delete_path": "Preparing deletion", "create_folder": "Preparing folder", "create_file": "Preparing file",
     "write_script": "Preparing script", "uninstall_app": "Finding the app", "brightness": "Adjusting brightness",
     "screenshot": "Taking a screenshot", "ask_ai": "Consulting another AI", "ai_code_job": "Preparing a coding job",
+    "phone_open_app": "Opening on your phone", "phone_close_app": "Closing on your phone", "phone_volume": "Phone volume",
+    "phone_media": "Phone media", "phone_status": "Checking your phone", "phone_screenshot": "Capturing your phone",
+    "phone_call": "Opening the dialer", "phone_message": "Writing the message", "phone_open": "Opening on your phone",
+    "phone_type": "Typing on your phone", "phone_screen": "Phone screen", "phone_uninstall_app": "Finding the phone app",
 }
 
 
@@ -58,6 +62,8 @@ directly from your own knowledge, without a tool
 - any arithmetic or percentages -> calculate
 - finding documents, photos or files on the PC -> find_files, then open_file with a path it returned
 - opening apps, sites, music, timers, reminders, lists, volume, the home network -> the matching tool
+- anything on the user's phone ("on my phone"), calls and messages -> the phone_ tools; without "phone", apps, \
+volume and media mean this PC
 - "ask Claude" / "ask Gemini", or a hard coding question -> ask_ai; writing code AND running it -> ai_code_job
 - deleting a file or folder -> find_files first, then delete_path with the exact path it returned
 - creating files or folders, writing a script or program, uninstalling an app -> create_file, create_folder, \
@@ -109,10 +115,57 @@ async def _ollama(messages: list[dict], use_tools: bool) -> dict:
 
 
 _groq_paused_until = 0.0
+# Each Groq model has its own per-minute budget (8,000 tokens on the free plan), so when one is used up the next
+# one answers instead of the slow local model. Models the account can't use are dropped.
+_model_paused: dict[str, float] = {}
+_model_gone: set[str] = set()
+
+
+def _groq_models() -> list[str]:
+    return [m for m in config.GROQ_MODELS if m not in _model_gone]
+
+
+def _ready_models() -> list[str]:
+    now = time.time()
+    return [m for m in _groq_models() if _model_paused.get(m, 0) <= now]
 
 
 def provider() -> str:
-    return "groq" if config.GROQ_API_KEY and time.time() >= _groq_paused_until else "local"
+    return "groq" if config.GROQ_API_KEY and time.time() >= _groq_paused_until and _ready_models() else "local"
+
+
+# Tools sent to the cloud model: the core set plus groups the question mentions. All 48 descriptions are ~2,000
+# tokens, a quarter of the per-minute budget, on every call.
+CORE_TOOLS = {"web_search", "wikipedia", "get_weather", "calculate", "remember", "get_news"}
+TOOL_GROUPS = [
+    (r"\b(phone|mobile|android|call|dial|text|sms|message|whatsapp)\b", "phone_"),
+    (r"\b(delete|remove|trash|create|make|new|folder|file|document|script|program|code|uninstall|write)\b",
+     {"find_files", "open_file", "delete_path", "create_folder", "create_file", "write_script", "uninstall_app"}),
+    (r"\b(claude|gemini|chatgpt|gpt|ai|code|script|program|run)\b", {"ask_ai", "ai_code_job"}),
+    (r"\b(open|close|launch|start|quit|app|website|site|play|youtube|song|music|video|pause|next|volume|mute|louder|quieter)\b",
+     {"open_app", "close_app", "open_website", "search_in_browser", "play_youtube", "media", "volume"}),
+    (r"\b(timer|remind|reminder|alarm|minutes?|hours?|tomorrow|tonight|at \d)\b",
+     {"set_timer", "set_reminder", "list_reminders", "cancel_reminder"}),
+    (r"\b(list|todo|to-do|note|notes|shopping|tick|done)\b", {"add_note", "list_notes", "complete_note"}),
+    (r"\b(remember|forget|know about me|my name|favou?rite)\b", {"forget"}),
+    (r"\b(cpu|memory|ram|disk|battery|system|pc|laptop|computer|screen|brightness|screenshot|lock)\b",
+     {"system_status", "brightness", "screenshot", "lock_screen"}),
+    (r"\b(wifi|wi-fi|network|devices?|router|online)\b", {"network_devices"}),
+    (r"\b(find|search|where|my files?|photos?|pictures?|resume)\b", {"find_files", "open_file"}),
+    (r"\b(time|date|day|today)\b", {"get_time"}),
+]
+
+
+def tools_for(text: str) -> list[dict]:
+    t = text.lower()
+    names = set(CORE_TOOLS)
+    for pattern, group in TOOL_GROUPS:
+        if re.search(pattern, t):
+            if isinstance(group, str):
+                names |= {n for n in TOOLS if n.startswith(group)}
+            else:
+                names |= group
+    return [TOOLS[n]["schema"] for n in TOOLS if n in names]
 
 
 def _to_openai(messages: list[dict]) -> list[dict]:
@@ -139,37 +192,78 @@ def _args(raw) -> dict:
         return {}
 
 
-async def _groq(messages: list[dict], use_tools: bool) -> dict:
-    body = {"model": config.GROQ_MODEL, "messages": _to_openai(messages), "temperature": 0.4, "max_tokens": 400}
-    if use_tools:
-        body["tools"] = schemas()
-    r = await _http.post(f"{config.GROQ_URL}/chat/completions", json=body, timeout=30,
-                         headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"})
-    r.raise_for_status()
-    msg = r.json()["choices"][0]["message"]
+def _groq_body(model: str, messages: list[dict], max_tokens: int, temperature: float) -> dict:
+    body = {"model": model, "messages": _to_openai(messages), "temperature": temperature, "max_tokens": max_tokens}
+    if model.startswith("openai/gpt-oss"):
+        body["reasoning_effort"] = "low"  # quick spoken answers, not long hidden reasoning
+    elif model.startswith("qwen/qwen3"):
+        body["reasoning_format"] = "hidden"
+    return body
+
+
+async def _groq_post(body_for, timeout: int = 30) -> dict:
+    """Tries each ready Groq model in turn. Raises the last error if none answers."""
+    global _groq_paused_until
+    last: Exception | None = None
+    for model in _ready_models():
+        try:
+            r = await _http.post(f"{config.GROQ_URL}/chat/completions", json=body_for(model), timeout=timeout,
+                                 headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"})
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            last = e
+            code = e.response.status_code
+            if code == 429:
+                wait = e.response.headers.get("retry-after", "30")
+                _model_paused[model] = time.time() + min(float(wait) if wait.replace(".", "").isdigit() else 30, 3600)
+                print(f"[brain] {model} is at its free limit; trying the next model")
+            elif code == 404 or "model_not_found" in e.response.text or "decommissioned" in e.response.text:
+                _model_gone.add(model)
+                print(f"[brain] {model} isn't available to this Groq account; dropping it")
+            elif code in (401, 403):
+                print("[brain] Groq refused the API key; using the local model. Check GROQ_API_KEY in backend/.env.")
+                _groq_paused_until = time.time() + 3600
+                raise
+            elif code == 400 and "tool" in e.response.text.lower():
+                raise  # a bad tool call from this model; the caller retries without tools
+            else:
+                print(f"[brain] Groq error {code} on {model}: {e.response.text[:160]}")
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            last = e
+            print(f"[brain] Groq unreachable ({e}); answering locally")
+            _groq_paused_until = time.time() + 30
+            break
+    raise last or RuntimeError("No Groq model available")
+
+
+async def _groq(messages: list[dict], tools: list[dict] | None) -> dict:
+    def body_for(model: str) -> dict:
+        body = _groq_body(model, messages, 400, 0.4)
+        if tools:
+            body["tools"] = tools
+        return body
+
+    data = await _groq_post(body_for)
+    msg = data["choices"][0]["message"]
     calls = [{"id": c["id"], "function": {"name": c["function"]["name"], "arguments": _args(c["function"].get("arguments"))}}
              for c in msg.get("tool_calls") or []]
     return {"content": msg.get("content") or "", "tool_calls": calls}
 
 
-async def _llm(messages: list[dict], use_tools: bool) -> dict:
-    """Groq when a key is set and it's answering; the local model otherwise, or whenever Groq fails."""
-    global _groq_paused_until
+async def _llm(messages: list[dict], use_tools: bool, tools: list[dict] | None = None) -> dict:
+    """Groq when a key is set and a model is free; the local model otherwise, or whenever Groq fails."""
     if provider() == "groq":
         try:
-            return await _groq(messages, use_tools)
+            return await _groq(messages, (tools or schemas()) if use_tools else None)
         except httpx.HTTPStatusError as e:
-            code = e.response.status_code
-            if code == 429:  # free-tier limit: use the local model until it resets
-                wait = e.response.headers.get("retry-after", "60")
-                _groq_paused_until = time.time() + min(float(wait) if wait.replace(".", "").isdigit() else 60, 3600)
-            elif code in (401, 403):
-                print("[brain] Groq refused the API key; using the local model. Check GROQ_API_KEY in backend/.env.")
-                _groq_paused_until = time.time() + 3600
-            print(f"[brain] Groq error {code}: {e.response.text[:200]}; answering locally")
-        except (httpx.HTTPError, KeyError, ValueError) as e:
-            print(f"[brain] Groq unavailable ({e}); answering locally")
-            _groq_paused_until = time.time() + 60
+            if e.response.status_code == 400 and use_tools:
+                try:  # the model fumbled a tool call; ask again without tools
+                    return await _groq(messages, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return await _ollama(messages, use_tools)
 
 
@@ -225,11 +319,12 @@ async def handle(text: str) -> AsyncIterator[dict]:
                 {"role": "user", "content": f"{text}\n\n{context_note()}{recap}"}]
 
     used, cards, answer, approval = [], {}, "", None
+    cloud_tools = tools_for(" ".join([text, *asked[-1:]]))
     try:
         for round_no in range(config.MAX_TOOL_ROUNDS + 1):
             if approval:
                 break
-            msg = await _llm(messages, use_tools=round_no < config.MAX_TOOL_ROUNDS)
+            msg = await _llm(messages, use_tools=round_no < config.MAX_TOOL_ROUNDS, tools=cloud_tools)
             calls = msg.get("tool_calls") or []
             content = _tidy(msg.get("content") or "")
             if not calls and not used and (not content or REFUSAL.search(content)
@@ -291,13 +386,9 @@ async def write_code(task: str, language: str) -> str:
         {"role": "user", "content": task}]
     if provider() == "groq":
         try:
-            r = await _http.post(f"{config.GROQ_URL}/chat/completions", timeout=60,
-                                 headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
-                                 json={"model": config.GROQ_MODEL, "messages": messages, "temperature": 0.2,
-                                       "max_tokens": 3000})
-            r.raise_for_status()
-            code = r.json()["choices"][0]["message"]["content"]
-        except (httpx.HTTPError, KeyError, ValueError):
+            data = await _groq_post(lambda m: _groq_body(m, messages, 3000, 0.2), timeout=60)
+            code = data["choices"][0]["message"]["content"]
+        except Exception:
             code = None
     else:
         code = None

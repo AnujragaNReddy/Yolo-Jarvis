@@ -19,7 +19,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 
 # Optional fast cloud brain and ears (free tier at console.groq.com). Without a key everything stays local.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Tried in order; each has its own free per-minute limit. Comma-separated to choose your own.
+GROQ_MODELS = [m.strip() for m in os.getenv(
+    "GROQ_MODEL", "openai/gpt-oss-120b,openai/gpt-oss-20b,qwen/qwen3.8-27b").split(",") if m.strip()]
 GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_URL = "https://api.groq.com/openai/v1"
 NETWORK_SCANNER_URL = os.getenv("NETWORK_SCANNER_URL", "http://127.0.0.1:8030").rstrip("/")

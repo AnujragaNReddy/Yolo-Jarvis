@@ -11,7 +11,7 @@ from datetime import datetime
 
 from . import db
 from .admin import Refused
-from .tools import coders, files, info, memory, network, system, timers
+from .tools import coders, files, info, memory, network, phone, system, timers
 
 _pending: dict = {}
 
@@ -94,6 +94,83 @@ def _r(text: str, tool: str, **cards) -> dict:
     return {"text": text, "tool": tool, "cards": cards}
 
 
+PHONE = r"(?: (?:on|in|from|of) (?:my |the )?(?:phone|mobile|android))"
+
+
+def _phone(t: str, raw: str) -> dict | None:
+    """Phone commands: anything ending "on my phone", plus calls and messages (only a phone can do those)."""
+    def run(fn, label, *a, **k) -> dict:
+        try:
+            return _r(fn(*a, **k), label)
+        except Refused as e:
+            return _r(str(e), label)
+        except Exception as e:
+            return _r(f"Your phone didn't respond: {e}", label)
+
+    def original(fragment: str) -> str:
+        m = re.search(re.escape(fragment), raw, re.I)
+        return m.group(0) if m else fragment
+
+    if m := re.search(r"\b(?:pair(?:ing)?|code)\b.*?(?P<code>\d(?:[\s-]?\d){5})\b.*?\b(?:port|address|on)\b\D*?"
+                      r"(?:(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\D+)?(?P<port>\d{4,5})\b", t):
+        ip = m.group("ip") or db.setting("phone_ip")
+        if not ip:
+            return _r("Type the full address from the pairing box, like 192.168.1.20:40447, in the phone panel.", "phone_pair")
+        return run(phone.pair, "phone_pair", f"{ip}:{m.group('port')}", m.group("code"))
+    if re.fullmatch(r"(pair|link|connect|reconnect)( to)? (my |the )?(phone|mobile)|(phone|mobile) (connect|reconnect|pair)", t):
+        if t.startswith("pair") or t.startswith("link") or t.endswith("pair"):
+            return _r(phone.PROBLEMS["not_set_up"].replace("Your phone isn't linked yet. ", ""), "phone_pair")
+        try:
+            phone.connect(force=True)
+            return _r("Your phone is connected.", "phone_connect")
+        except Refused as e:
+            return _r(str(e), "phone_connect")
+    if m := re.fullmatch(rf"(uninstall|remove|delete) (the )?(app )?(?P<n>[\w\s.'+&-]+?)( app)?{PHONE}", t):
+        return _plan(lambda: phone.phone_uninstall_app(m.group("n")), "phone_uninstall_app")
+    if m := re.fullmatch(rf"open (?P<u>[\w-]+(\.[\w-]+)+(/\S*)?){PHONE}", t):
+        return run(phone.phone_open, "phone_open", url=m.group("u"))
+    if m := re.fullmatch(rf"(open|launch|start) (the )?(?P<n>[\w\s.'+&-]+?)( app)?{PHONE}", t):
+        return run(phone.phone_open_app, "phone_open_app", m.group("n"))
+    if m := re.fullmatch(rf"(close|quit|kill|stop) (the )?(?P<n>[\w\s.'+&-]+?)( app)?{PHONE}", t):
+        return run(phone.phone_close_app, "phone_close_app", m.group("n"))
+    if m := re.fullmatch(rf"play (?P<q>.+?)( on youtube)?{PHONE}", t):
+        if m.group("q") in ("music", "it", "the music", "the song"):
+            return run(phone.phone_media, "phone_media", "play")
+        return run(phone.phone_open, "phone_open", youtube=m.group("q"))
+    if m := re.fullmatch(rf"(?:(?:turn|set) )?(?:the )?(?:volume )?(?P<a>up|down|louder|quieter|mute|unmute)(?: the volume)?{PHONE}|"
+                         rf"(?:volume|turn the volume) (?P<b>up|down){PHONE}|mute{PHONE}", t):
+        a = (m.group("a") or m.group("b") or "mute").replace("louder", "up").replace("quieter", "down")
+        return run(phone.phone_volume, "phone_volume", a)
+    if m := re.fullmatch(rf"(set )?(the )?volume (to |at )?(?P<n>\d{{1,3}})( percent|%)?{PHONE}", t):
+        return run(phone.phone_volume, "phone_volume", "set", int(m.group("n")))
+    if m := re.fullmatch(rf"(?P<a>pause|resume|play|next|skip|previous)( the)?( song| track| music| video)?{PHONE}", t):
+        return run(phone.phone_media, "phone_media", m.group("a"))
+    if re.fullmatch(rf"(take a |take |capture (a |the )?)?screen ?shot{PHONE}|screen ?shot (of )?(my |the )?(phone|mobile)", t):
+        return run(phone.phone_screenshot, "phone_screenshot")
+    if re.fullmatch(rf"lock{PHONE}|lock (my |the )?(phone|mobile)|(turn|switch) off (my |the )?(phone|mobile) screen", t):
+        return run(phone.phone_screen, "phone_screen", "lock")
+    if re.fullmatch(r"(wake|unlock|turn on) (up )?(my |the )?(phone|mobile)( screen)?", t):
+        return run(phone.phone_screen, "phone_screen", "wake")
+    if re.fullmatch(r"(how('s| is) |what('s| is) )?(my |the )?(phone|mobile)('s)? (battery|status|charge)( level)?|"
+                    r"(phone|mobile) (battery|status)|how much (battery|charge) (is )?(on|in|left on) (my |the )?(phone|mobile)", t):
+        try:
+            s = phone.phone_status()
+            return _r(f"Your {s['maker']} phone is at {s['battery']}%{', charging' if s['charging'] else ''}.", "phone_status")
+        except Refused as e:
+            return _r(str(e), "phone_status")
+    if m := re.fullmatch(rf"open (?P<u>[\w-]+(\.[\w-]+)+(/\S*)?){PHONE}", t):
+        return run(phone.phone_open, "phone_open", url=m.group("u"))
+    if m := re.fullmatch(r"(whatsapp|send a whatsapp( message)? to|whatsapp message) (?P<who>.+?) (saying|that says|to say|:) (?P<msg>.+)", t):
+        return run(phone.phone_message, "phone_message", original(m.group("who")), original(m.group("msg")), "whatsapp")
+    if m := re.fullmatch(r"(text|message|send a message to|send message to|send a text to|sms) (?P<who>.+?) (saying|that says|to say|:) (?P<msg>.+)", t):
+        return run(phone.phone_message, "phone_message", original(m.group("who")), original(m.group("msg")), "sms")
+    if m := re.fullmatch(rf"(call|phone|ring|dial) (to )?(?!me\b)(?P<who>.+?){PHONE}?", t):
+        return run(phone.phone_call, "phone_call", original(m.group("who")))
+    if re.fullmatch(r"(message|text|whatsapp|send a message to) (to )?(?!me\b).+", t):
+        return _r(f"What should the message say, {you()}? Say for example: message Thangam saying I'm on my way.", "chat")
+    return None
+
+
 def _plan(make, tool: str) -> dict:
     try:
         return {"text": "", "tool": tool, "cards": {}, "plan": make()}
@@ -113,6 +190,10 @@ def match(raw: str) -> dict | None:
             return _r(run(), label)
         if re.fullmatch(r"(no|nope|cancel|don't|do not|stop|never ?mind|abort)", t):
             return _r("Cancelled.", label)
+
+    # Phone first, so "... on my phone" never reaches the laptop's commands.
+    if (r := _phone(t, raw)) is not None:
+        return r
 
     def ask(question: str, run, label: str) -> dict:
         # Things that can't be undone wait for a spoken "confirm" (30 s), and the model can never trigger them.
@@ -178,8 +259,6 @@ def match(raw: str) -> dict | None:
     if re.fullmatch(r"(no|nope|yes|yeah|yep|ok|okay|sure|fine|alright|all right|got it|cool|hmm+|um+|uh+)", t):
         return _r(f"Very good, {you()}.", "chat")
 
-    if m := re.fullmatch(r"(call|phone|ring|dial|video call|message|text|whatsapp|send a message to|send message to) (to )?(?!me\b)(?P<who>.+)", t):
-        return _r(f"I can't make calls or send messages yet, {you()}. I can open WhatsApp for you if you like.", "chat")
 
     if re.fullmatch(r"(take a |take |capture (a |the )?)?screen ?shot|screen capture|capture (the |my )?screen", t):
         return _r(system.screenshot(), "screenshot")

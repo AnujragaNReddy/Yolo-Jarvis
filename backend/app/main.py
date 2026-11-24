@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import access, admin, brain, config, db, stt, tts
-from .tools import info, memory, network, system, timers
+from .tools import info, memory, network, phone, system, timers
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 _listeners: set[asyncio.Queue] = set()
@@ -42,6 +42,16 @@ async def _reminder_loop():
                 q.put_nowait(event)
 
 
+async def _phone_loop():
+    while True:
+        try:
+            await asyncio.to_thread(phone.keep_alive)
+            _cache.pop("phone", None)
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
 def _broadcast(event: dict) -> None:
     for q in list(_listeners):
         q.put_nowait(event)
@@ -54,7 +64,8 @@ async def lifespan(app: FastAPI):
     coders.notify = _broadcast
     db.conn()
     tasks = [asyncio.create_task(_reminder_loop()), asyncio.create_task(brain.warm_up()),
-             asyncio.create_task(asyncio.to_thread(system.warm)), asyncio.create_task(asyncio.to_thread(stt.warm))]
+             asyncio.create_task(asyncio.to_thread(system.warm)), asyncio.create_task(asyncio.to_thread(stt.warm)),
+             asyncio.create_task(_phone_loop())]
     yield
     for t in tasks:
         t.cancel()
@@ -174,8 +185,10 @@ async def status():
     weather = await _cached("weather", 600, info.get_weather)
     net = await _cached("network", 60, network.summary)
     news = await _cached("news", 900, info.get_news)
+    mobile = await _cached("phone", 30, phone.summary)
     return {
         "news": news or [],
+        "phone": mobile,
         "system": system.stats(),
         "weather": weather,
         "network": net,
@@ -190,7 +203,8 @@ async def health():
     models = await brain.models()
     model = db.setting("model")
     return {"ok": True, "ollama": bool(models), "model": model, "model_installed": model in models,
-            "provider": brain.provider(), "cloud_model": config.GROQ_MODEL if config.GROQ_API_KEY else None}
+            "provider": brain.provider(),
+            "cloud_model": (brain._ready_models() or ["none free right now"])[0] if config.GROQ_API_KEY else None}
 
 
 @app.get("/api/settings")
@@ -331,6 +345,32 @@ async def admin_verify(request: Request, id: str):
 async def admin_cancel(body: dict):
     admin.cancel(str(body.get("id", "")))
     return {"ok": True}
+
+
+class PairBody(BaseModel):
+    address: str
+    code: str
+
+
+@app.post("/api/phone/pair")
+async def phone_pair(body: PairBody):
+    try:
+        result = await asyncio.to_thread(phone.pair, body.address, body.code)
+    except admin.Refused as e:
+        raise HTTPException(400, str(e))
+    _cache.pop("phone", None)
+    return {"text": result, "phone": await asyncio.to_thread(phone.summary)}
+
+
+@app.post("/api/phone/connect")
+async def phone_connect():
+    try:
+        await asyncio.to_thread(phone.connect, True)
+        text = "Phone connected."
+    except admin.Refused as e:
+        text = str(e)
+    _cache.pop("phone", None)
+    return {"text": text, "phone": await asyncio.to_thread(phone.summary)}
 
 
 @app.get("/jarvis-ca.crt")

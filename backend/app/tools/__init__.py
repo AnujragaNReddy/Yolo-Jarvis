@@ -58,4 +58,4 @@ def run(name: str, args: dict | str | None) -> str:
     return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
 
 
-from . import info, system, memory, timers, network, files, coders  # noqa: E402,F401  (registers the tools)
+from . import info, system, memory, timers, network, files, coders, phone  # noqa: E402,F401  (registers the tools)
