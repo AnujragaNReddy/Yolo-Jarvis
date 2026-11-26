@@ -57,7 +57,9 @@ function pickMode() {
   if (CAN_RECORD) return 'tap'
   return 'type'
 }
-const wakeOn = () => pickMode() === 'wake'
+// The PC itself listens for "Hey JARVIS" (backend/app/wake.py), so a HUD on that PC leaves the wake word to it.
+let pcWake = false
+const wakeOn = () => pickMode() === 'wake' && !pcWake
 
 /* ---------------- state ---------------- */
 const LABEL = { standby: 'STANDBY', active: 'LISTENING', thinking: 'PROCESSING', speaking: 'SPEAKING', off: 'MIC OFF' }
@@ -337,7 +339,7 @@ function chime(freq = 880, dur = 0.12, times = 1) {
 
 function idleState() {
   const mode = pickMode()
-  return mode === 'wake' && !ears.wanted ? 'off' : 'standby'
+  return mode === 'wake' && !pcWake && !ears.wanted ? 'off' : 'standby'
 }
 
 // First sentence alone (short = fast to make), then groups of up to ~220 characters.
@@ -992,11 +994,26 @@ function jobDone(ev) {
   setTimeout(wait, 600)
 }
 
+// "Hey JARVIS" heard by the PC itself: the PC records and speaks; the HUD only shows what's happening.
+function pcVoice(ev) {
+  if (ev.stage === 'wake') { mouth.stop(); setState('active'); hear(`Yes, ${you()}?`) }
+  else if (ev.stage === 'heard') {
+    hear(ev.text); addLog('user', ev.text)
+    $('cards').replaceChildren(); $('answer').replaceChildren()
+    setState('thinking'); activity('Processing')
+  } else if (ev.stage === 'tool') activity(ev.label || 'Working')
+  else if (ev.stage === 'answer') {
+    activity(''); showAnswer(ev.text); renderCards(ev.cards || {}); addLog('assistant', ev.text, ev.tools || [])
+    setState('speaking')
+  } else if (ev.stage === 'done') { activity(''); setState(idleState()); refresh(); loadMemory() }
+}
+
 function listen() {
   const es = new EventSource('/api/events')
   es.onmessage = async (m) => {
     const ev = JSON.parse(m.data)
     if (ev.type === 'job') { jobDone(ev); return }
+    if (ev.type === 'voice') { pcVoice(ev); return }
     if (ev.type !== 'reminder') return
     const line = ev.kind === 'timer' ? `${You()}, your ${ev.text} is done.` : `${You()}, a reminder: ${ev.text}.`
     chime(880, 0.14, 4)
@@ -1081,12 +1098,15 @@ async function saveSettings() {
 
 function applyMode() {
   const mode = pickMode()
-  if (mode === 'wake') {
+  if (mode === 'wake' && pcWake) {
+    ears.stop()
+  } else if (mode === 'wake') {
     if (!ears.rec) ears.init()
     ears.start()
   } else {
     ears.stop()
   }
+  if (mode === 'wake' && pcWake) { chip('chip-ears', 'EARS: "HEY JARVIS" (PC)', 'ok'); setState('standby'); return }
   chip('chip-ears', { wake: 'EARS: "JARVIS"', tap: 'EARS: TAP TO TALK', type: 'EARS: TYPE ONLY' }[mode], mode === 'type' ? 'warn' : 'ok')
   $('mic').classList.toggle('off', mode === 'type')
   setState(idleState())
@@ -1194,7 +1214,11 @@ async function boot() {
   await line('> Initialising J.A.R.V.I.S. core…')
   let health = null
   try { health = await api('/api/health') } catch { /* offline */ }
-  try { settings = { ...settings, ...(await api('/api/settings')).settings } } catch { /* offline */ }
+  try {
+    const s = await api('/api/settings')
+    settings = { ...settings, ...s.settings }
+    pcWake = !!s.pc_wake
+  } catch { /* offline */ }
   if (!health) {
     await line('> Core offline. Run start.bat and reload.', 0)
     $('boot-go').textContent = 'Core offline'
@@ -1217,7 +1241,7 @@ async function boot() {
       health.ollama && health.model_installed ? 'ok' : 'bad')
   }
   const mode = pickMode()
-  await line(`> Voice input: ${{ wake: 'always listening for "Jarvis"', tap: 'tap to talk, understood on your PC',
+  await line(`> Voice input: ${{ wake: pcWake ? 'this PC is always listening for "Hey JARVIS"' : 'always listening for "Jarvis"', tap: 'tap to talk, understood on your PC',
     type: !window.isSecureContext ? 'off (the microphone needs the https link); type commands' : 'no microphone support here; type commands' }[mode]}`)
   await line('> Telemetry, memory banks, schedule… linked')
   await Promise.all([refresh(), loadHistory(), loadMemory()])

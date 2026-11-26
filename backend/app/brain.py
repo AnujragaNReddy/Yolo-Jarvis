@@ -28,6 +28,9 @@ LABELS = {
     "phone_media": "Phone media", "phone_status": "Checking your phone", "phone_screenshot": "Capturing your phone",
     "phone_call": "Opening the dialer", "phone_message": "Writing the message", "phone_open": "Opening on your phone",
     "phone_type": "Typing on your phone", "phone_screen": "Phone screen", "phone_uninstall_app": "Finding the phone app",
+    "type_text": "Typing", "press_keys": "Pressing keys", "window_control": "Arranging windows",
+    "pc_setting": "Changing settings", "processes": "Checking processes", "clipboard": "Clipboard",
+    "run_command": "Preparing a command", "read_screen": "Reading the screen", "click_on": "Clicking",
 }
 
 
@@ -68,12 +71,19 @@ volume and media mean this PC
 - deleting a file or folder -> find_files first, then delete_path with the exact path it returned
 - creating files or folders, writing a script or program, uninstalling an app -> create_file, create_folder, \
 write_script, uninstall_app. These are only carried out after the owner approves by voice, so never say they are done.
+- typing text or pressing keys and shortcuts on this PC -> type_text, press_keys; copy/paste contents -> clipboard
+- switching, minimising, maximising, snapping, closing or scrolling windows -> window_control
+- Wi-Fi, Bluetooth, dark mode or any Settings page -> pc_setting; what's running or a frozen app -> processes
+- what's on the screen -> read_screen; clicking a named button, link, tab or box on screen -> click_on \
+(read_screen first if unsure of the exact label)
+- anything else on this PC that a PowerShell command can do -> run_command with one safe command; it only runs \
+after the owner approves by voice, so never say it is done
 - the user TELLS you a new lasting fact about themselves (a statement, not a question) -> remember
 Answer jokes, opinions and chat yourself; answer questions about the user from the "Known about the user" context.
 Search results mix old and new pages: for "latest" or "most recent" questions, use the result with the newest date, \
 and remember the current date is in the context note.
 Never invent a tool result. If a tool fails or finds nothing, say so in a few words.
-If no tool can do what the user asks (calls, messages, emails, payments, clicking inside apps), say plainly that \
+If no tool can do what the user asks (payments, anything outside this PC and phone), say plainly that \
 you can't do that yet; never use an unrelated tool instead.
 Replies are spoken aloud: one to three short sentences of plain speech, no markdown, lists, emojis or links."""
 
@@ -102,7 +112,9 @@ def _keep_alive() -> str:
 async def _ollama(messages: list[dict], use_tools: bool) -> dict:
     model = db.setting("model")
     body = {"model": model, "messages": messages, "stream": False, "keep_alive": _keep_alive(),
-            "options": {"temperature": 0.4, "num_ctx": 6144, "num_predict": 220}}
+            # The system prompt and all 57 tool descriptions are ~4,700 tokens on their own; 8k leaves room for the
+            # question, up to four tool results and the answer.
+            "options": {"temperature": 0.4, "num_ctx": 8192, "num_predict": 220}}
     if model.startswith(THINKING_FAMILIES):
         body["think"] = False  # spoken replies need speed more than a long hidden reasoning pass
     if use_tools:
@@ -153,6 +165,14 @@ TOOL_GROUPS = [
     (r"\b(wifi|wi-fi|network|devices?|router|online)\b", {"network_devices"}),
     (r"\b(find|search|where|my files?|photos?|pictures?|resume)\b", {"find_files", "open_file"}),
     (r"\b(time|date|day|today)\b", {"get_time"}),
+    (r"\b(type|write|press|keys?|shortcut|ctrl|control|alt|enter|copy|paste|undo|save|select)\b",
+     {"type_text", "press_keys", "clipboard"}),
+    (r"\b(windows?|switch|minimi[sz]e|maximi[sz]e|restore|snap|scroll|desktop|tab)\b", {"window_control"}),
+    (r"\b(wi-?fi|bluetooth|dark|light|mode|settings?|airplane|night|disturb|focus|hotspot|theme)\b", {"pc_setting"}),
+    (r"\b(process(es)?|running|kill|frozen|stuck|not responding|explorer|taskbar|task manager)\b", {"processes"}),
+    (r"\b(clipboard|copied)\b", {"clipboard"}),
+    (r"\b(command|powershell|terminal|cmd|run|execute|ip address|dns|drivers?|registry|service)\b", {"run_command"}),
+    (r"\b(screen|page|click|button|link|tick|untick|check ?box|see|look|showing|read)\b", {"read_screen", "click_on"}),
 ]
 
 

@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import access, admin, brain, config, db, stt, tts
+from . import access, admin, brain, config, db, stt, tts, wake
 from .tools import info, memory, network, phone, system, timers
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
@@ -62,10 +62,13 @@ async def lifespan(app: FastAPI):
     from .tools import coders
 
     coders.notify = _broadcast
+    loop = asyncio.get_running_loop()
+    wake.notify = lambda event: loop.call_soon_threadsafe(_broadcast, event)
     db.conn()
     tasks = [asyncio.create_task(_reminder_loop()), asyncio.create_task(brain.warm_up()),
              asyncio.create_task(asyncio.to_thread(system.warm)), asyncio.create_task(asyncio.to_thread(stt.warm)),
              asyncio.create_task(_phone_loop())]
+    wake.start(loop)
     yield
     for t in tasks:
         t.cancel()
@@ -208,9 +211,10 @@ async def health():
 
 
 @app.get("/api/settings")
-async def get_settings():
+async def get_settings(request: Request):
+    # pc_wake: this PC already listens for "Hey JARVIS" itself, so a HUD open on this PC must not listen too.
     return {"settings": {k: v for k, v in db.settings().items() if k in config.DEFAULTS},
-            "voices": tts.VOICES, "models": await brain.models()}
+            "voices": tts.VOICES, "models": await brain.models(), "pc_wake": wake.active() and _local(request)}
 
 
 @app.post("/api/settings")

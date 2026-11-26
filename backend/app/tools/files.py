@@ -194,7 +194,7 @@ def plan_empty_recycle_bin() -> dict:
 
 
 PLANNERS = {"delete_path", "create_folder", "create_file", "write_script", "uninstall_app", "ai_code_job",
-            "phone_uninstall_app"}
+            "phone_uninstall_app", "run_command"}
 
 
 def _code_cli() -> str | None:
@@ -265,6 +265,12 @@ async def execute(plan: dict) -> str:
         from .phone import uninstall
 
         return uninstall(a)
+    if kind == "run_command":
+        import asyncio
+
+        from .control import execute_command
+
+        return await asyncio.to_thread(execute_command, a["command"])
     if kind == "ai_code":
         from .coders import start_job
 

@@ -11,7 +11,7 @@ from datetime import datetime
 
 from . import db
 from .admin import Refused
-from .tools import coders, files, info, memory, network, phone, system, timers
+from .tools import coders, control, files, info, memory, network, phone, system, timers
 
 _pending: dict = {}
 
@@ -171,6 +171,138 @@ def _phone(t: str, raw: str) -> dict | None:
     return None
 
 
+SHORTCUTS = {
+    "copy": "ctrl+c", "copy that": "ctrl+c", "copy this": "ctrl+c", "copy it": "ctrl+c",
+    "paste": "ctrl+v", "paste it": "ctrl+v", "paste that": "ctrl+v", "paste here": "ctrl+v",
+    "cut": "ctrl+x", "cut that": "ctrl+x", "undo": "ctrl+z", "undo that": "ctrl+z", "redo": "ctrl+y",
+    "select all": "ctrl+a", "select everything": "ctrl+a", "save": "ctrl+s", "save it": "ctrl+s",
+    "save this": "ctrl+s", "save the file": "ctrl+s", "new tab": "ctrl+t", "open a new tab": "ctrl+t",
+    "close tab": "ctrl+w", "close the tab": "ctrl+w", "close this tab": "ctrl+w", "reopen tab": "ctrl+shift+t",
+    "reopen the tab": "ctrl+shift+t", "next tab": "ctrl+tab", "previous tab": "ctrl+shift+tab",
+    "refresh": "f5", "refresh the page": "f5", "reload": "f5", "reload the page": "f5",
+    "find": "ctrl+f", "find on page": "ctrl+f", "print": "ctrl+p", "zoom in": "ctrl+plus", "zoom out": "ctrl+minus",
+    "switch window": "alt+tab", "switch windows": "alt+tab", "alt tab": "alt+tab",
+    "open task view": "win+tab", "task view": "win+tab", "open notifications": "win+n", "open emoji": "win+period",
+    "press enter": "enter", "hit enter": "enter", "press escape": "esc", "press tab": "tab",
+}
+
+
+def _ctl(make, tool: str) -> dict:
+    try:
+        out = make()
+    except Refused as e:
+        return _r(str(e), tool)
+    if isinstance(out, list):
+        out = "; ".join(out[:8]) + "."
+    return _r(out, tool)
+
+
+def _control(t: str, raw: str) -> dict | None:
+    """Keyboard, windows, settings, processes, clipboard and screen commands that need no AI."""
+    if t in SHORTCUTS:
+        return _ctl(lambda: control.press_keys(SHORTCUTS[t]), "press_keys")
+    if m := re.fullmatch(r"(press|hit|push) (the )?(?P<k>[\w +]+?)( key| keys| shortcut)?( (?P<n>\d+|two|three|four|five) times)?", t):
+        try:
+            control.parse_combo(m.group("k"))  # "press the Save button" is a click, not a key
+        except Refused:
+            m = None
+        if m:
+            n = {"two": 2, "three": 3, "four": 4, "five": 5}.get(m.group("n") or "", None) or int(m.group("n") or 1)
+            return _ctl(lambda: control.press_keys(m.group("k"), times=n), "press_keys")
+    if re.match(r"(type|type out|write out|dictate) \S", t):
+        m = re.search(r"\b(?:type out|type|write out|dictate)\s+(.+?)\s*$", raw, re.I | re.S)
+        text, app = (m.group(1) if m else t.split(" ", 1)[1]).strip(), ""
+        tail = re.search(r"^(.*\S)\s+in(?:to)?\s+(?:the\s+)?([\w .'-]{2,30})$", text, re.I)
+        if tail:
+            try:
+                control.pick_window(tail.group(2))
+                text, app = tail.group(1), tail.group(2)
+            except Refused:
+                pass
+        text = text.strip().strip('"\'')
+        return _ctl(lambda: control.type_text(text, app), "type_text")
+
+    win = r"(this |the |current |that )?(window|app)"
+    if m := re.fullmatch(rf"(?P<a>minimi[sz]e|maximi[sz]e|restore|close) {win}", t):
+        return _ctl(lambda: control.window_control(m.group("a").replace("is", "iz")), "window_control")
+    if m := re.fullmatch(r"(?P<a>minimi[sz]e|maximi[sz]e|restore) (the )?(?P<app>[\w .'+-]+?)( window| app)?", t):
+        return _ctl(lambda: control.window_control(m.group("a").replace("is", "iz"), m.group("app")), "window_control")
+    if (m := re.fullmatch(r"(switch|go|change|jump) (back )?to (the )?(?P<app>[\w .'+-]+?)( window| app)?", t)) \
+            and not re.search(r"\b(mode|theme|sleep|bed)\b", t):
+        try:  # only when that window is open; "go to youtube" etc. carry on to the other commands
+            control.pick_window(m.group("app"))
+            return _ctl(lambda: control.window_control("switch", m.group("app")), "window_control")
+        except Refused:
+            pass
+    if m := re.fullmatch(r"snap (?P<app>[\w .'+-]+? )?(to (the )?)?(?P<side>left|right)", t):
+        app = (m.group("app") or "").strip()
+        app = "" if app in ("this", "it", "the window", "this window", "window") else app
+        return _ctl(lambda: control.window_control("snap_" + m.group("side"), app), "window_control")
+    if m := re.fullmatch(r"scroll (?P<d>up|down)( (a bit|more|the page))?", t):
+        return _ctl(lambda: control.window_control("scroll_" + m.group("d")), "window_control")
+    if re.fullmatch(r"(list|show|what are) (my |the |all )?(open )?windows( are open)?|what windows are open", t):
+        return _ctl(lambda: control.window_control("list"), "window_control")
+
+    if m := re.fullmatch(r"(turn|switch) (?P<v>on|off) (the )?(?P<s>wi-?fi|wifi|bluetooth|dark mode|light mode)", t) or \
+            re.fullmatch(r"(turn|switch) (the )?(?P<s>wi-?fi|wifi|bluetooth|dark mode|light mode) (?P<v>on|off)", t) or \
+            re.fullmatch(r"(?P<v>enable|disable) (the )?(?P<s>wi-?fi|wifi|bluetooth|dark mode|light mode)", t) or \
+            re.fullmatch(r"(?P<s>wi-?fi|wifi|bluetooth|dark mode|light mode) (?P<v>on|off)", t):
+        v = {"enable": "on", "disable": "off"}.get(m.group("v"), m.group("v"))
+        s = m.group("s").replace("-", "").replace(" ", "_")
+        return _ctl(lambda: control.pc_setting(s, v), "pc_setting")
+    if re.fullmatch(r"(go |switch )?(to )?dark mode( please)?|make (it|everything|the screen) dark", t):
+        return _ctl(lambda: control.pc_setting("dark_mode", "on"), "pc_setting")
+    if re.fullmatch(r"(go |switch )?(to )?light mode( please)?", t):
+        return _ctl(lambda: control.pc_setting("light_mode", "on"), "pc_setting")
+    if m := re.fullmatch(r"(connect|join) (to )?(the )?(wi-?fi( network)? )?(?P<n>.+?)( wi-?fi)?( network)?", t):
+        if "wifi" in t.replace("-", "") or "network" in t:
+            name = re.search(re.escape(m.group("n")), raw, re.I)
+            return _ctl(lambda: control.pc_setting("wifi", name.group(0) if name else m.group("n")), "pc_setting")
+    if re.fullmatch(r"(what|which|show|list|scan for)( are)?( the)?( wi-?fi)? networks( are)?( (nearby|around|in range))?|what wi-?fi networks can you see", t):
+        return _ctl(lambda: control.pc_setting("wifi", "list"), "pc_setting")
+    if re.fullmatch(r"(is )?(the )?(wi-?fi|bluetooth)( status| on| off)?", t) and "is" in t.split()[:1]:
+        return _ctl(lambda: control.pc_setting("bluetooth" if "bluetooth" in t else "wifi", "status"), "pc_setting")
+
+    if m := re.fullmatch(r"(force (close|quit|kill|stop)|kill|end task( for)?|terminate) (the )?(?P<n>[\w .'+-]+?)( app| process| program)?( (now|it'?s (frozen|stuck|not responding)))?", t):
+        if t.startswith(("force", "end task", "terminate")) or re.search(r"frozen|stuck|not responding", t):
+            return _ctl(lambda: control.processes("kill", m.group("n")), "processes")
+    if re.fullmatch(r"(what('s| is) running|list (the )?(running )?(apps|programs|processes)|what('s| is) using (the most )?(my )?(memory|ram|cpu)|(show|list) processes)", t):
+        return _ctl(lambda: control.processes("list"), "processes")
+    if re.fullmatch(r"restart (windows )?explorer|fix (the |my )?taskbar|restart (the )?taskbar", t):
+        return _ctl(lambda: control.processes("restart_explorer"), "processes")
+
+    if re.fullmatch(r"(what('s| is) (in|on) (my |the )?clipboard|read (my |the )?clipboard|what did i copy)", t):
+        return _ctl(lambda: control.clipboard("read"), "clipboard")
+    if re.fullmatch(r"clear (my |the )?clipboard", t):
+        return _ctl(lambda: control.clipboard("clear"), "clipboard")
+
+    if m := re.fullmatch(r"(what('s| is) on|read|describe|look at|what do you see on) (my |the |this )?(screen|window|page)( (in|of) (?P<app>[\w .'+-]+))?", t):
+        def say() -> str:
+            s = control.read_screen(m.group("app") or "")
+            ctrls = [c for c in s["controls"] if not c.startswith(("toolbar", "menu bar"))]
+            parts = [f"In {s['window']}"]
+            if ctrls:
+                parts.append("I can see " + "; ".join(ctrls[:8]))
+            if s["text"]:
+                parts.append("The text includes: " + " ".join(s["text"][:4])[:300])
+            return ". ".join(parts) + "."
+        return _ctl(say, "read_screen")
+    if (m := re.fullmatch(r"(?P<a>double click|double-click|right click|right-click|click|tap|press|tick|untick) (on )?(the )?(?P<x>.+?)( button| link| tab| checkbox| box| option| menu)?( (in|on) (the )?(?P<app>[\w .'+-]+?)( window| app)?)?", t)) \
+            and (m.group("a") not in ("press", "tap") or re.search(r"\b(button|link|tab|checkbox|box|option|menu)\b", t)):
+        action = {"double click": "double_click", "double-click": "double_click", "right click": "right_click",
+                  "right-click": "right_click"}.get(m.group("a"), "click")
+        want = re.search(re.escape(m.group("x")), raw, re.I)
+        app = m.group("app") or ""
+        if app:
+            try:
+                control.pick_window(app)
+            except Refused:
+                want, app = re.search(re.escape(m.group("x") + " " + t.split(m.group("x"), 1)[1].strip()), raw, re.I), ""
+        label = want.group(0) if want else m.group("x")
+        return _ctl(lambda: control.click_on(label, app, action), "click_on")
+    return None
+
+
 def _plan(make, tool: str) -> dict:
     try:
         return {"text": "", "tool": tool, "cards": {}, "plan": make()}
@@ -272,6 +404,9 @@ def match(raw: str) -> dict | None:
         return _r(system.show_desktop(), "show_desktop")
     if m := re.fullmatch(r"open (the )?(?P<page>wi-?fi|bluetooth|display|sound|battery|update|windows update|network|apps|storage) settings", t):
         return _r(system.open_settings(m.group("page")), "open_settings")
+
+    if (r := _control(t, raw)) is not None:
+        return r
 
     if re.fullmatch(r"(hi|hello|hey|yo|good (morning|afternoon|evening)|wake up|are you there|you there)", t):
         if t.startswith("good morning") or t == "wake up":

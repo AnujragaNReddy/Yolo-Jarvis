@@ -7,3 +7,7 @@ ddgs>=9.0
 python-dotenv>=1.0
 faster-whisper>=1.1
 cryptography>=43
+uiautomation==2.0.20
+openwakeword==0.6.0
+sounddevice>=0.5
+av>=15,<17  # faster-whisper 1.2 breaks on av 19 (metadata_errors)
