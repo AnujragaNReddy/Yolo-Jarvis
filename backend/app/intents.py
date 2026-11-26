@@ -191,14 +191,25 @@ def match(raw: str) -> dict | None:
         if re.fullmatch(r"(no|nope|cancel|don't|do not|stop|never ?mind|abort)", t):
             return _r("Cancelled.", label)
 
-    # Phone first, so "... on my phone" never reaches the laptop's commands.
-    if (r := _phone(t, raw)) is not None:
-        return r
-
     def ask(question: str, run, label: str) -> dict:
         # Things that can't be undone wait for a spoken "confirm" (30 s), and the model can never trigger them.
         _pending.update(run=run, label=label, expires=time.time() + 30)
         return _r(f"{question} Say confirm to proceed.", label)
+
+    # WhatsApp to a phone number, sent from this PC through WhatsApp Web (after a spoken confirm).
+    if "whatsapp" in t and not re.search(r"\b(phone|mobile)\b", t) and (n := re.search(r"\+?\d[\d\s-]{7,17}\d", t)):
+        mm = (re.search(r"(?:saying|that says|to say|:)\s*(?P<m>.+)$", t)
+              or re.search(r"send (?:a |an |the )?(?P<m>[\w' ]+?)(?: message| msg)? to\b", t))
+        if mm:
+            msg = mm.group("m").strip()
+            msg = re.search(re.escape(msg), raw, re.I).group(0) if re.search(re.escape(msg), raw, re.I) else msg
+            num = n.group(0).strip()
+            return ask(f"Send \"{msg}\" to {num} on WhatsApp from this PC, {you()}?",
+                       lambda: system.whatsapp_send(num, msg), "whatsapp")
+
+    # Phone first, so "... on my phone" never reaches the laptop's commands.
+    if (r := _phone(t, raw)) is not None:
+        return r
 
     if m := re.fullmatch(r"(shut ?down|turn off|power off|restart|reboot)( the| my)? ?(computer|pc|laptop|system)?", t):
         action = "restart" if m.group(1) in ("restart", "reboot") else "shutdown"

@@ -167,6 +167,23 @@ def _press(vk: int, times: int = 1) -> None:
         time.sleep(0.01)
 
 
+def whatsapp_send(number: str, text: str) -> str:
+    """Send a WhatsApp Web message from this PC. Not a model tool: only reachable through a spoken "confirm" (intents.py)."""
+    digits = re.sub(r"\D", "", number)
+    if len(digits) == 10:
+        digits = "91" + digits  # 10-digit Indian mobile numbers need the country code
+    if not 8 <= len(digits) <= 15:
+        return "That doesn't look like a phone number."
+    webbrowser.open(f"https://web.whatsapp.com/send?phone={digits}&text={urllib.parse.quote(text)}")
+
+    def press_enter() -> None:
+        time.sleep(18)  # WhatsApp Web needs a while to load the chat and fill in the message
+        _press(0x0D)
+
+    threading.Thread(target=press_enter, daemon=True).start()
+    return f"Opening WhatsApp Web and sending your message to +{digits}. If WhatsApp Web asks you to scan a QR code, it can't send until you do."
+
+
 @tool("Change the PC's volume.", action="string: up, down, mute, unmute or set",
       level="integer?: 0-100, only for set")
 def volume(action: str, level: int | None = None) -> str:

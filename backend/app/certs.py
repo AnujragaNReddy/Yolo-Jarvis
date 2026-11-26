@@ -58,16 +58,29 @@ def _covers(ip: str) -> bool:
     return ipaddress.ip_address(ip) in ips
 
 
+def _tailscale_ip() -> str | None:
+    """This PC's Tailscale address, if Tailscale is installed and connected (private network, not the internet)."""
+    import subprocess
+    try:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+        return str(ipaddress.ip_address(out[0])) if out else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def ensure() -> tuple[str, str]:
     """Paths to the server certificate and key, (re)made when the PC's network address changes."""
     DIR.mkdir(parents=True, exist_ok=True)
     ip = access.lan_ip() or "127.0.0.1"
-    if _covers(ip):
+    ts = _tailscale_ip()
+    if _covers(ip) and (not ts or _covers(ts)):
         return str(CERT), str(KEY)
     ca_cert, ca_key = _ca()
     key = ec.generate_private_key(ec.SECP256R1())
     sans = [x509.DNSName("localhost"), x509.DNSName(socket.gethostname()),
             x509.IPAddress(ipaddress.ip_address("127.0.0.1")), x509.IPAddress(ipaddress.ip_address(ip))]
+    if ts and ts != ip:
+        sans.append(x509.IPAddress(ipaddress.ip_address(ts)))
     # 397 days: the longest lifetime Apple and Chrome accept for a server certificate.
     cert = (x509.CertificateBuilder()
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, f"JARVIS {ip}")]))
